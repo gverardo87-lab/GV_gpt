@@ -1,0 +1,45 @@
+# === Python envs ===
+.venv/
+venv/
+env/
+
+# === Byte-compiled / cache ===
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+
+# === Build / packaging ===
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# === Test / coverage ===
+.pytest_cache/
+.coverage
+htmlcov/
+
+# === Notebooks ===
+.ipynb_checkpoints/
+
+# === Tool caches ===
+.cache/
+.mypy_cache/
+.pytype/
+.pyre/
+
+# === Logs ===
+logs/
+*.log
+
+# === IDE / OS ===
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# === Secrets ===
+.env
+.env.local
