@@ -1,60 +1,56 @@
-# core/gpt_client.py
+# core/gpt_clienti.py
 import os, time
-from pathlib import Path
-from dotenv import load_dotenv
+from typing import List, Dict, Any
+
 from openai import OpenAI
+from openai import RateLimitError  # sdk 1.x
+from openai import APIError
 
-# Carica .env dalla root del progetto (robusto a working dir diverse)
-ROOT = Path(__file__).resolve().parents[1]
-load_dotenv(ROOT / ".env")
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-def _get_client():
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY non trovato (.env in root).")
-    return OpenAI(api_key=api_key)
+def _model():
+    return os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
 
-def call_gpt_chat(messages, temperature: float = 0.7, retries: int = 1):
-    """
-    messages: lista di dict [{"role":"system/user/assistant","content":"..."}]
-    """
-    client = _get_client()
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+def call_gpt_chat(messages: List[Dict[str, Any]], temperature: float = 0.7, retries: int = 2) -> str:
+    delay = 1.5
     last_err = None
-    for _ in range(retries + 1):
+    for attempt in range(retries + 1):
         try:
             resp = client.chat.completions.create(
-                model=model,
+                model=_model(),
                 messages=messages,
-                temperature=temperature
+                temperature=temperature,
+                stream=False,
             )
+            # sdk 1.x
             return resp.choices[0].message.content
+        except RateLimitError as e:
+            last_err = e
+            time.sleep(delay); delay *= 2
+        except APIError as e:
+            last_err = e
+            # status 429 o codici di quota
+            code = getattr(e, "status_code", None)
+            text = str(e).lower()
+            if code == 429 or "insufficient_quota" in text or "rate" in text and "limit" in text:
+                time.sleep(delay); delay *= 2
+            else:
+                break
         except Exception as e:
             last_err = e
-            time.sleep(0.6)
-    raise last_err
+            break
+    # errore finale con messaggio pulito
+    raise RuntimeError(f"OpenAI error: {str(last_err)}")
 
-def stream_gpt_chat(messages, temperature: float = 0.7):
-    """
-    Generatore che emette testo man mano che arriva (stream=True).
-    Usalo con Streamlit: st.write_stream(stream_gpt_chat(messages))
-    """
-    client = _get_client()
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+def stream_gpt_chat(messages: List[Dict[str, Any]], temperature: float = 0.7):
+    # streaming standard; lascia che l'app gestisca il fallback se fallisce
     stream = client.chat.completions.create(
-        model=model,
+        model=_model(),
         messages=messages,
         temperature=temperature,
-        stream=True
+        stream=True,
     )
     for chunk in stream:
-        # Nuovo SDK: il testo incrementale è in choices[0].delta.content
-        delta = getattr(chunk.choices[0].delta, "content", None)
+        delta = (chunk.choices[0].delta.content or "")
         if delta:
             yield delta
-
-# Compat vecchia: singolo messaggio
-def call_gpt(user_message: str) -> str:
-    system = {"role": "system",
-              "content": "Sei GV Assistant. Italiano, chiaro, operativo. Usa elenchi quando aiuta."}
-    return call_gpt_chat([system, {"role": "user", "content": user_message}])
