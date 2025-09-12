@@ -19,6 +19,7 @@ load_dotenv(ROOT / ".env")  # carica .env dalla root (robusto a working dir dive
 import streamlit as st
 
 # 2) Import dei moduli del progetto
+from core.memory import load_memory, save_memory, clear_memory
 from nlp_layer.preprocessing import analyze_text
 from orchestrator.orchestrator import compose_prompt
 # system_prompt_for_intent è opzionale: se non c'è, usiamo un fallback
@@ -37,13 +38,30 @@ except Exception:
 
 from core.gpt_clienti import call_gpt_chat, stream_gpt_chat  # entrambe supportate
 from core.logger import get_logger
+import json
+from datetime import datetime
+
+def export_chat_md(history: list) -> str:
+    lines = ["# Conversazione GV GPT\n"]
+    for msg in history:
+        role = "Tu" if msg["role"] == "user" else "GV"
+        lines.append(f"**{role}:** {msg['content']}\n")
+    return "\n".join(lines)
+
+def export_chat_json(history: list) -> str:
+    payload = {
+        "exported_at": datetime.now().isoformat(timespec="seconds"),
+        "model": os.getenv("OPENAI_MODEL") or "gpt-4o-mini",
+        "messages": history,
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 # 3) Logger
 log = get_logger()
 
 # 4) Streamlit UI setup
 st.set_page_config(page_title="GV GPT Custom", page_icon="🤖", layout="centered")
-st.title("🤖 GV GPT Custom — Demo Middleware")
+st.title("🤖 GV GPT Custom — la AI di Giacomino")
 
 # Sidebar (opzionale ma utile)
 with st.sidebar:
@@ -53,14 +71,44 @@ with st.sidebar:
     if st.button("🧹 Svuota chat"):
         st.session_state.history = []
         st.rerun()
+    st.header("🧠 Memoria")
+    persist = st.checkbox(
+        "Mantieni chat tra riavvii",
+        value=True,
+        help="Salva gli ultimi messaggi su disco (data/memory_default.json)."
+    )
+    if st.button("🗑️ Cancella memoria salvata"):
+        clear_memory()
+        st.success("Memoria persistente cancellata.")
+    st.header("📤 Export")
+    has_chat = bool(st.session_state.get("history"))
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.download_button(
+            "Markdown .md",
+            data=export_chat_md(st.session_state.history if has_chat else []),
+            file_name=f"chat_{ts}.md",
+            mime="text/markdown",
+            disabled=not has_chat
+        )
+    with col2:
+        st.download_button(
+            "JSON .json",
+            data=export_chat_json(st.session_state.history if has_chat else []),
+            file_name=f"chat_{ts}.json",
+            mime="application/json",
+            disabled=not has_chat
+        )
 
 # Avviso se manca la chiave
 if not os.getenv("OPENAI_API_KEY"):
     st.warning("⚠️ OPENAI_API_KEY non trovato. Crea un file `.env` nella root del progetto.")
 
-# 5) Stato conversazione
+# 5) Stato conversazione (usa memoria persistente se presente)
 if "history" not in st.session_state:
-    st.session_state.history = []   # ciascun item: {"role": "user/assistant", "content": "..."}
+    st.session_state.history = load_memory()   # ciascun item: {"role": "user/assistant", "content": "..."}
 
 # 6) Mostra conversazione già presente
 for msg in st.session_state.history:
@@ -72,6 +120,9 @@ if user := st.chat_input("Scrivi qui…"):
     # salva input
     st.session_state.history.append({"role": "user", "content": user})
     log.info(f"USER: {user}")
+    # salva memoria persistente se attiva
+    if persist:
+        save_memory(st.session_state.history)
 
     # NLP + orchestrator
     nlp_data = analyze_text(user)

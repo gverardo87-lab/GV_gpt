@@ -33,6 +33,7 @@ htmlcov/
 # === Logs ===
 logs/
 *.log
+data/
 
 # === IDE / OS ===
 .idea/
