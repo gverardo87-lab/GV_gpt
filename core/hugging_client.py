@@ -155,3 +155,4 @@ def call_hugging_chat(
         text = json.dumps(data, ensure_ascii=False)
 
     return text.strip()
+

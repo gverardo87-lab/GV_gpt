@@ -27,6 +27,16 @@ from io import BytesIO
 from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
 
+# --- Boot Guard (anti-mix progetti) ------------------------------------------
+# Tenta import del guard dedicato; se manca, fallback inline.
+try:
+    import core.boot_guard  # noqa: F401
+except Exception:
+    EXPECTED = os.getenv("GV_EXPECTED_PROJECT", "GV_EXT")
+    PID = os.getenv("PROJECT_ID")
+    if PID and PID != EXPECTED:
+        raise SystemExit(f"[ABORT] Wrong PROJECT_ID. Expected {EXPECTED}, got {PID!r}.")
+
 # Default Ollama model se non in .env
 if not os.getenv("OLLAMA_MODEL"):
     os.environ["OLLAMA_MODEL"] = "phi3:3.8b"
@@ -631,11 +641,11 @@ if user := st.chat_input("Scrivi qui…"):
                     else st.session_state["hf_model"] if engine_now == "hugging"
                     else st.session_state["ollama_model"]
                 )):
-                    if not isinstance(delta, str):
+                    # Step 4: filtra heartbeat/whitespace per evitare "spazi fantasma"
+                    if not isinstance(delta, str) or not delta.strip():
                         continue
                     pieces.append(delta)
-                    text = "".join(pieces)
-                    placeholder.markdown(text)
+                    placeholder.markdown("".join(pieces))
                 reply = "".join(pieces).strip()
                 if not reply:
                     raise RuntimeError("Nessun testo dallo stream")
