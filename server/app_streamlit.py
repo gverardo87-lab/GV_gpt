@@ -5,8 +5,9 @@
 # - 🔒 Engine Lock + Fallback smart (se lock OFF): OpenAI → HuggingFace → Ollama
 # - Didattica + Thinking longform "continue-only" con outline+tail (Ollama)
 # - Streaming: OpenAI/Ollama; HuggingFace pseudo-stream (tutto in un colpo)
-# - Memoria persistente, export, diagnostica, slider num_predict per Ollama
+# - Memoria persistente, export, diagnostica, slider num_predict e temperatura per Ollama
 # - Toggle “Alta leggibilità” per passare da scenografico a pro
+# - Sanitizer anti meta-marker + filtri anti drift (“Instruction/Your task/Begin by”)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # 0) Ponte: assicura che la root del progetto sia nel PYTHONPATH
@@ -28,7 +29,6 @@ from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
 
 # --- Boot Guard (anti-mix progetti) ------------------------------------------
-# Tenta import del guard dedicato; se manca, fallback inline.
 try:
     import core.boot_guard  # noqa: F401
 except Exception:
@@ -81,6 +81,34 @@ except Exception:
         raise RuntimeError("Diagnostica Ollama non disponibile (core/ollama_client.py mancante).")
 
 log = get_logger()
+
+# --- Sanitizer / Post-processor anti drift -----------------------------------
+# 1) Rimuove token stile LLM (<|...|>) e direttive tra [] (INTENT, ecc.)
+META_RX = re.compile(
+    r"(?is)(<\|[^>]*\|>"
+    r"|\[(?:INTENT|EXPLICIT[\s_-]*ACTION[\s_-]*LIST)[^\]]*\]"
+    r"|\[[A-Z][A-Z0-9 _-]{2,}:[^\]]*\]"
+    r"|\[[A-Z][A-Z0-9 _-]{2,}\])"  # es. [STILE DIDATTICO]
+)
+def _sanitize_meta(s: str) -> str:
+    if not s:
+        return s
+    return META_RX.sub("", s).strip()
+
+# 2) Rimuove prefissi tipo "Instruction …" / "I'm sorry …"
+DRIFT_PREFIX_RX = re.compile(r"(?is)^\s*(instruction[s]?:.*?\n+|\s*i['’]m\s+sorry[^.\n]*[.\n]+\s*)")
+def _strip_drift_prefix(text: str) -> str:
+    if not text:
+        return text
+    out = DRIFT_PREFIX_RX.sub("", text).lstrip()
+    return out if out else text
+
+# 3) Sopprime righe “Your task: … / Instruction: … / Begin by …” ovunque compaiano
+DRIFT_LINES_RX = re.compile(r"(?im)^\s*(your\s+task|instruction|begin\s+by)\s*:\s.*$")
+def _strip_drift_lines(text: str) -> str:
+    if not text:
+        return text
+    return DRIFT_LINES_RX.sub("", text)
 
 # ==== Export helpers ==========================================================
 def export_chat_md(history: list) -> str:
@@ -148,7 +176,7 @@ def _looks_cutoff(txt: str) -> bool:
         return False
     return not re.search(r'[.!?…]"?\s*\Z', txt.strip())
 
-def _short_history_by_chars(history_msgs: list, max_chars: int = 5000) -> list:
+def _short_history_by_chars(history_msgs: list, max_chars: int = 9000) -> list:
     """
     Ritorna la coda della history fino a raggiungere ~max_chars sommando i contenuti.
     Mantiene l'ordine e i ruoli, esclude eventuali messaggi 'system'.
@@ -454,10 +482,15 @@ with st.sidebar:
     else:
         current_ollama = ollama_sel
 
-    st.header("📝 Lunghezza risposta (Ollama)")
+    st.header("📝 Output (Ollama)")
     default_tok = int(os.getenv("OLLAMA_NUM_PREDICT", "900") or "900")
-    tok = st.slider("Token di output max", 200, 1600, default_tok, help="Aumenta se la risposta si ferma a metà.")
+    tok = st.slider("Token di output max", 200, 5000, default_tok, help="Aumenta se la risposta si ferma a metà.")
     os.environ["OLLAMA_NUM_PREDICT"] = str(tok)
+    temp = st.slider(
+        "Temperatura (decodifica)", 0.1, 1.0, float(os.getenv("OLLAMA_TEMPERATURE", "0.3")), 0.1,
+        help="Valori più bassi = più stabile e meno divagazioni."
+    )
+    os.environ["OLLAMA_TEMPERATURE"] = str(temp)
 
     if st.button("✅ Applica"):
         st.session_state["engine"] = "openai" if engine_choice == "OpenAI" else ("hugging" if engine_choice == "HuggingFace" else "ollama")
@@ -576,7 +609,14 @@ def _update_outline_if_needed(full_text: str, every_round: int, round_idx: int, 
 if st.session_state.get("do_continue"):
     st.session_state.pop("do_continue", None)
     last_user_text, last_assistant_text = _find_last_user_and_assistant(st.session_state.history)
+    engine_now = st.session_state.get("engine", "openai")
     system_text = system_prompt_for_intent("general")
+    if engine_now == "ollama":
+        system_text += " Mantieni rigorosamente la lingua italiana per tutta la risposta; non passare a inglese o spagnolo. Se accade, correggiti e torna subito all'italiano."
+
+    # Sanitize degli ultimi turni
+    san_last_user = _sanitize_meta(last_user_text)
+    san_last_assistant = _sanitize_meta(last_assistant_text)
 
     with st.chat_message("assistant"):
         t0 = time.time()
@@ -584,14 +624,16 @@ if st.session_state.get("do_continue"):
         try:
             msgs = build_continue_only_messages(
                 system_once=system_text,
-                history=[{"role": "user", "content": last_user_text},
-                         {"role": "assistant", "content": last_assistant_text}],
-                final_text_tail=_tail(last_assistant_text, 1500),
-                round_words=600,
+                history=[{"role": "user", "content": san_last_user},
+                         {"role": "assistant", "content": san_last_assistant}],
+                final_text_tail=_tail(san_last_assistant, 3000),
+                round_words=800,
                 didactic=False,
             )
             chunk = call_chat_smart(msgs, temperature=0.7)  # non-stream per applicare guardie
-            if _looks_restart(chunk) or _is_reduant(chunk, last_assistant_text) or _too_similar(chunk, last_assistant_text):
+            # Anti-drift/apology/Instruction
+            chunk = _strip_drift_lines(_strip_drift_prefix(chunk))
+            if _looks_restart(chunk) or _is_reduant(chunk, san_last_assistant) or _too_similar(chunk, san_last_assistant):
                 chunk = re.sub(r'(?is)^.{0,300}\n', '', chunk, count=1).strip()
             reply = (chunk or "").replace("<<FINE>>","").strip()
             st.markdown(reply if reply else "_(nessun avanzamento)_")
@@ -606,21 +648,36 @@ if st.session_state.get("do_continue"):
 
 # 8) Input utente (turno normale)
 if user := st.chat_input("Scrivi qui…"):
-    st.session_state.history.append({"role": "user", "content": user})
-    log.info(f"USER: {user}")
+    # Sanitizza subito l'input per evitare drift (marker/meta-tag)
+    san_user = _sanitize_meta(user)
+
+    st.session_state.history.append({"role": "user", "content": san_user})
+    log.info(f"USER: {san_user}")
 
     # NLP + orchestrator
-    nlp_data = analyze_text(user)
+    nlp_data = analyze_text(san_user)
     with st.expander("🔎 NLP insight", expanded=False):
         st.write(nlp_data)
 
-    enriched_user = compose_prompt(user, nlp_data)
+    engine_now = st.session_state.get("engine", "openai")
+    # Prompt arricchito (di default)
+    enriched_user = compose_prompt(san_user, nlp_data)
+    # ⛳ Su OLLAMA inviamo SOLO la domanda pulita (evita trigger “Instruction” del dataset)
+    if engine_now == "ollama":
+        enriched_user = san_user
+
     intent = nlp_data.get("intent", "general")
     system_text = system_prompt_for_intent(intent)
-    didactic_suffix = "\n\n[STILE DIDATTICO] Struttura a sezioni con titoli, definizioni chiare, esempi pratici e, alla fine, 3 domande quiz con risposte." if st.session_state.get("didactic", True) else ""
+    if engine_now == "ollama":
+        system_text += " Mantieni rigorosamente la lingua italiana per tutta la risposta; non passare a inglese o spagnolo. Se accade, correggiti e torna subito all'italiano."
+    didactic_suffix = (
+        "\n\nStile didattico: organizza a sezioni con titoli brevi, definizioni chiare, esempi pratici e, in chiusura, 3 domande-quiz con relative risposte."
+        if st.session_state.get("didactic", True) else ""
+    )
 
-    # History corta per non saturare contesto (specie con Ollama/HF)
-    short_history = _short_history_by_chars(st.session_state.history[:-1], max_chars=5000)
+    # History corta per non saturare contesto (specie con Ollama/HF) + sanitizzazione
+    short_history = _short_history_by_chars(st.session_state.history[:-1], max_chars=9000)
+    short_history = [{"role": m["role"], "content": _sanitize_meta(m.get("content",""))} for m in short_history]
 
     base_messages = [{"role": "system", "content": system_text}] + short_history + [
         {"role": "user", "content": enriched_user + didactic_suffix}
@@ -630,7 +687,6 @@ if user := st.chat_input("Scrivi qui…"):
         t0 = time.time()
         reply = ""
 
-        engine_now = st.session_state["engine"]
         try:
             if st.session_state.get("streaming_on", True):
                 # Streaming robusto via placeholder (NO st.write per token!)
@@ -641,11 +697,14 @@ if user := st.chat_input("Scrivi qui…"):
                     else st.session_state["hf_model"] if engine_now == "hugging"
                     else st.session_state["ollama_model"]
                 )):
-                    # Step 4: filtra heartbeat/whitespace per evitare "spazi fantasma"
+                    # Filtra heartbeat/whitespace per evitare "spazi fantasma"
                     if not isinstance(delta, str) or not delta.strip():
                         continue
                     pieces.append(delta)
-                    placeholder.markdown("".join(pieces))
+                    text = "".join(pieces)
+                    # Post-process live: togli prefissi/righe “Instruction/Your task/Begin by”
+                    text = _strip_drift_lines(_strip_drift_prefix(text))
+                    placeholder.markdown(text)
                 reply = "".join(pieces).strip()
                 if not reply:
                     raise RuntimeError("Nessun testo dallo stream")
@@ -655,6 +714,7 @@ if user := st.chat_input("Scrivi qui…"):
                     else st.session_state["hf_model"] if engine_now == "hugging"
                     else st.session_state["ollama_model"]
                 ))
+                reply = _strip_drift_lines(_strip_drift_prefix(reply))
                 st.markdown(reply)
 
             # AUTO-CONTINUE: se si ferma a metà (Ollama) e non c'è <<FINE>>
@@ -663,16 +723,19 @@ if user := st.chat_input("Scrivi qui…"):
                     system_once=system_text,
                     history=[{"role":"user","content": enriched_user + didactic_suffix},
                              {"role":"assistant","content": reply}],
-                    final_text_tail=_tail(reply, 1500),
-                    round_words=600,
+                    final_text_tail=_tail(reply, 3000),
+                    round_words=800,
                     didactic=st.session_state.get("didactic", False),
                 )
-                more = call_chat_smart(msgs, temperature=0.7)
+                more = _strip_drift_lines(_strip_drift_prefix(call_chat_smart(msgs, temperature=0.7)))
                 if more and more.strip():
                     more = more.replace("<<FINE>>", "").strip()
                     reply = (reply + ("\n\n" if not reply.endswith("\n\n") else "") + more).strip()
                     # aggiorna a schermo
-                    placeholder.markdown(reply)
+                    if st.session_state.get("streaming_on", True):
+                        placeholder.markdown(reply)
+                    else:
+                        st.markdown(reply)
 
         except Exception as e:
             if not st.session_state.get("engine_lock", False):
@@ -682,6 +745,7 @@ if user := st.chat_input("Scrivi qui…"):
                         else st.session_state["hf_model"] if engine_now == "hugging"
                         else st.session_state["ollama_model"]
                     ))
+                    reply = _strip_drift_lines(_strip_drift_prefix(reply))
                     st.markdown(reply)
                 except Exception as e2:
                     reply = f"⚠️ Errore modello: {str(e2).splitlines()[0]}"
