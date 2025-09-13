@@ -15,27 +15,40 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import requests
 
-# user helper: riuso funzione già presente nel tuo progetto
-try:
-    from core.ollama_client import build_simple_prompt_from_messages
-except Exception:
-    def build_simple_prompt_from_messages(messages: Iterable[Dict[str, str]]) -> str:
-        parts = []
-        sys = "\n".join([m.get("content","") for m in messages if m.get("role")=="system"]).strip()
-        if sys:
-            parts.append("[SYSTEM]\n" + sys)
-        dlg = []
-        for m in messages:
-            r = (m.get("role") or "").lower()
-            c = m.get("content") or ""
-            if r == "user":
-                dlg.append(f"Utente: {c}")
-            elif r == "assistant":
-                dlg.append(f"Assistente: {c}")
-        if dlg:
-            parts.append("[DIALOGO]\n" + "\n".join(dlg))
-        parts.append("\n---\nRispondi ora come Assistente, continuando dal contesto.")
-        return "\n".join(parts)
+DEFAULT_CONNECT_TIMEOUT = 10
+DEFAULT_READ_TIMEOUT = 90
+
+def _with_retry(fn, attempts: int = 2, base_delay: float = 0.6):
+    last = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if i < attempts - 1:
+                time.sleep(base_delay * (2 ** i))
+    raise last
+
+def build_simple_prompt_from_messages(messages: List[Dict[str, str]]) -> str:
+    """
+    Prompt semplice: system + dialogo utente/assistente.
+    """
+    parts: List[str] = []
+    sys = "\n".join([m.get("content","") for m in messages if m.get("role")=="system"]).strip()
+    if sys:
+        parts.append("[SYSTEM]\n" + sys)
+    dlg = []
+    for m in messages:
+        r = (m.get("role") or "").lower()
+        c = m.get("content") or ""
+        if r == "user":
+            dlg.append(f"Utente: {c}")
+        elif r == "assistant":
+            dlg.append(f"Assistente: {c}")
+    if dlg:
+        parts.append("[DIALOGO]\n" + "\n".join(dlg))
+    parts.append("\n---\nRispondi ora come Assistente, continuando dal contesto.")
+    return "\n".join(parts)
 
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
     v = os.getenv(name)
@@ -51,22 +64,9 @@ def hf_model() -> str:
 def hf_api_key() -> str:
     return _env("HUGGINGFACE_API_KEY", "") or ""
 
-DEFAULT_CONNECT_TIMEOUT = 10
-DEFAULT_READ_TIMEOUT = 90
-
-def _with_retry(fn, attempts: int = 3, base_delay: float = 0.8):
-    last = None
-    for i in range(attempts):
-        try:
-            return fn()
-        except Exception as e:
-            last = e
-            if i < attempts - 1:
-                time.sleep(base_delay * (2 ** i))
-    raise last
-
 def call_hugging_chat(
     messages: List[Dict[str, str]],
+    *,
     model: Optional[str] = None,
     temperature: Optional[float] = None,
     max_new_tokens: Optional[int] = None,
@@ -74,8 +74,8 @@ def call_hugging_chat(
     timeout: Optional[int] = None,
 ) -> str:
     """
-    Chiamata non-stream alla HuggingFace Inference API (text-generation).
-    Usa un prompt "semplice" costruito dai messages. Ritorna la stringa generata.
+    Chiamata non-stream alla Inference API (task text-generation).
+    Torna il testo generato (stringa).
     """
     if not messages:
         return ""
@@ -94,7 +94,7 @@ def call_hugging_chat(
         "temperature": float(temperature if temperature is not None else float(os.getenv("HUGGINGFACE_TEMPERATURE", "0.3"))),
         "top_p": float(top_p if top_p is not None else float(os.getenv("HUGGINGFACE_TOP_P", "0.9"))),
         "return_full_text": False,
-        # "do_sample": False,  # opzionale, puoi attivarla per risposte più deterministiche
+        # "do_sample": False,  # opzionale, per risposte più deterministiche
     }
     payload = {
         "inputs": prompt,
@@ -116,7 +116,20 @@ def call_hugging_chat(
         return requests.post(url, headers=headers, json=payload, timeout=(connect_to, read_to))
 
     resp = _with_retry(_do_post)
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        # Messaggio d'errore più parlante
+        detail = ""
+        try:
+            j = resp.json()
+            detail = j.get("error") or j.get("message") or ""
+        except Exception:
+            detail = (resp.text or "").strip()
+        msg = f"HuggingFace error {resp.status_code}: {detail}".strip()
+        if resp.status_code == 403 and ("inference" in (detail or "").lower() or "provider" in (detail or "").lower()):
+            msg += " • Possibile causa: abilitare le chiamate agli Inference Providers/Endpoints nel tuo account Hugging Face o usare un modello open access."
+        raise RuntimeError(msg) from e
 
     data = {}
     try:
@@ -125,10 +138,9 @@ def call_hugging_chat(
         pass
 
     # La Inference API spesso ritorna: [{"generated_text": "..."}]
-    # In altri casi ritorna direttamente un dict con chiavi diverse.
-    text = ""
+    # In altri casi ritorna {"generated_text": "..."} o {"text": "..."}
+    text: Any = ""
     if isinstance(data, list) and data:
-        # prova le chiavi note nella prima entry
         first = data[0]
         if isinstance(first, dict):
             text = first.get("generated_text") or first.get("generated_texts") or ""
