@@ -1,12 +1,12 @@
 # server/app_streamlit.py
 # ─────────────────────────────────────────────────────────────────────────────
 # GV_GPT — L’aria sta cambiando (Streamlit, tema nautico chiaro)
-# - Engine switch (OpenAI ↔ Ollama) + scelta modello (autodiscovery Ollama)
-# - 🔒 Engine Lock, fallback smart (se lock OFF)
-# - Didattica + Thinking longform "continue-only" con outline+tail
-# - Streaming: OpenAI/Ollama via placeholder (niente parole spezzate)
-# - Memoria persistente, export, diagnostica
-# - Slider per OLLAMA_NUM_PREDICT + auto-continue se il testo è troncato
+# - Engine switch: OpenAI ↔ HuggingFace ↔ Ollama
+# - 🔒 Engine Lock + Fallback smart (se lock OFF): OpenAI → HuggingFace → Ollama
+# - Didattica + Thinking longform "continue-only" con outline+tail (Ollama)
+# - Streaming: OpenAI/Ollama; HuggingFace pseudo-stream (tutto in un colpo)
+# - Memoria persistente, export, diagnostica, slider num_predict per Ollama
+# - Toggle “Alta leggibilità” per passare da scenografico a pro
 # ─────────────────────────────────────────────────────────────────────────────
 
 # 0) Ponte: assicura che la root del progetto sia nel PYTHONPATH
@@ -22,6 +22,8 @@ import time
 import re
 import difflib
 from datetime import datetime
+from io import BytesIO
+
 from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
 
@@ -31,6 +33,7 @@ if not os.getenv("OLLAMA_MODEL"):
 
 import streamlit as st
 import requests  # per autodiscovery modelli Ollama
+from PIL import Image
 
 # 2) Import moduli progetto
 from core.engine import (
@@ -38,11 +41,18 @@ from core.engine import (
 )
 from core.memory import load_memory, save_memory, clear_memory
 from core.logger import get_logger
-from nlp_layer.preprocessing import analyze_text
-from orchestrator.orchestrator import compose_prompt
+
+# NLP/Orchestrator – fallback soft se mancanti
 try:
-    from orchestrator.orchestrator import system_prompt_for_intent
+    from nlp_layer.preprocessing import analyze_text
 except Exception:
+    def analyze_text(txt: str):
+        return {"intent": "general", "entities": [], "lang": "it"}
+try:
+    from orchestrator.orchestrator import compose_prompt, system_prompt_for_intent
+except Exception:
+    def compose_prompt(user_text: str, nlp: dict) -> str:
+        return user_text
     def system_prompt_for_intent(intent: str) -> str:
         base = "Rispondi in italiano, chiaro e operativo. Usa elenchi dove utile. "
         if intent == "coding":
@@ -53,14 +63,18 @@ except Exception:
             return base + "Ricorda che non sostituisci il medico; cita linee guida generali."
         return base + "Adatta tono al contesto e resta sintetico."
 
-# Import per diagnostica (/api/generate legacy)
-from core.ollama_client import call_ollama_generate
+# Diagnostica Ollama (/api/generate legacy)
+try:
+    from core.ollama_client import call_ollama_generate
+except Exception:
+    def call_ollama_generate(*args, **kwargs):
+        raise RuntimeError("Diagnostica Ollama non disponibile (core/ollama_client.py mancante).")
 
 log = get_logger()
 
 # ==== Export helpers ==========================================================
 def export_chat_md(history: list) -> str:
-    lines = ["# Conversazione GV GPT\n"]
+    lines = ["# Conversazione GV_GPT\n"]
     for msg in history:
         role = "Tu" if msg["role"] == "user" else "GV"
         lines.append(f"**{role}:** {msg['content']}\n")
@@ -72,6 +86,7 @@ def export_chat_json(history: list) -> str:
         "engine": os.getenv("GV_ENGINE", "openai"),
         "openai_model": os.getenv("OPENAI_MODEL") or "gpt-4o-mini",
         "ollama_model": os.getenv("OLLAMA_MODEL") or "",
+        "hugging_model": os.getenv("HUGGINGFACE_MODEL") or "",
         "messages": history,
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
@@ -89,7 +104,7 @@ def _looks_restart(chunk: str) -> bool:
                 r"^la\s+storia\s+di\b", r"^prefazione\b"]
     return any(re.search(p, head) for p in patterns)
 
-def _is_redundant(chunk: str, acc: str) -> bool:
+def _is_reduant(chunk: str, acc: str) -> bool:
     tail = _tail(acc, 1200).lower()
     c = (chunk or "").lower()
     if not tail or not c:
@@ -119,88 +134,157 @@ def _find_last_user_and_assistant(history: list) -> tuple[str, str]:
     return last_user, last_assistant
 
 def _looks_cutoff(txt: str) -> bool:
-    """True se il testo sembra troncato (non termina con punteggiatura forte)."""
     if not txt:
         return False
     return not re.search(r'[.!?…]"?\s*\Z', txt.strip())
 
-# === THEME (nautico chiaro) & GLOBAL CSS ====================================
-def _nautical_css() -> str:
-    return """
-    <style>
-      @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@600;700&family=Inter:wght@400;600&display=swap');
-
-      :root{
-        --bg-top: #f7fbff;
-        --bg-bottom: #edf6ff;
-        --fg: #0f172a;
-        --fg-muted: #334155;
-        --border: #dbeafe;
-        --card: #ffffffee;
-        --bubble: #f8fbff;
-        --link: #0ea5e9;
-        --accent: #2563eb;
-        --input-bg: #ffffff;
-        --placeholder: #64748b;
-      }
-
-      [data-testid="stAppViewContainer"]{
-        background: linear-gradient(180deg, var(--bg-top) 0%, var(--bg-bottom) 100%);
-      }
-      [data-testid="stAppViewContainer"] .main .block-container{
-        background: var(--card);
-        border: 1px solid var(--border);
-        border-radius: 18px;
-        box-shadow: 0 6px 26px rgba(15, 23, 42, .06);
-        padding: 1rem 1.25rem 1.5rem 1.25rem;
-      }
-      .main .block-container, .main .block-container p, .main .block-container li, 
-      .main .block-container label, .main .block-container h1, .main .block-container h2, .main .block-container h3{
-        color: var(--fg);
-        font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-      }
-      .brand-title{
-        font-family: 'Plus Jakarta Sans', Inter, system-ui;
-        font-weight: 700; letter-spacing: .2px;
-        font-size: clamp(26px, 4vw, 40px);
-        color: var(--fg);
-      }
-      .brand-sub{ color: var(--fg-muted); font-size: 14px; margin-top: .25rem; }
-
-      .hero-card{
-        border-radius: 16px; padding: 14px 18px; border: 1px solid var(--border);
-        background: #fffffff6; box-shadow: 0 8px 24px rgba(2,6,23,.06);
-      }
-      .side-card{
-        border-radius: 16px; padding: 12px; border: 1px solid var(--border);
-        background: #ffffffbf; display:flex;align-items:center;justify-content:center; aspect-ratio: 1.8/1;
-      }
-      [data-testid="stChatMessage"] > div:first-child{
-        border-radius: 12px !important; border: 1px solid var(--border); background: var(--bubble);
-      }
-
-      /* INPUT leggibile */
-      [data-testid="stChatInput"] textarea{
-        background: var(--input-bg) !important; border: 1px solid var(--border) !important;
-        color: var(--fg) !important; caret-color: var(--accent) !important;
-      }
-      [data-testid="stChatInput"] textarea::placeholder{ color: var(--placeholder) !important; opacity: 1 !important; }
-      .stTextInput input, .stTextArea textarea{
-        background: var(--input-bg) !important; border: 1px solid var(--border) !important; color: var(--fg) !important;
-      }
-      .stTextInput input::placeholder, .stTextArea textarea::placeholder{ color: var(--placeholder) !important; opacity: 1 !important; }
-
-      .main .block-container a{ color: var(--link); text-decoration: none; }
-      .wave-wrap{height: 36px; overflow: hidden; margin-top: 6px;}
-
-      /* anti-splitting: niente parole spezzate durante lo stream */
-      [data-testid="stChatMessage"] p, [data-testid="stMarkdownContainer"] p {
-        overflow-wrap: break-word;
-        word-break: normal;
-        white-space: pre-wrap;
-      }
-    </style>
+def _short_history_by_chars(history_msgs: list, max_chars: int = 5000) -> list:
     """
+    Ritorna la coda della history fino a raggiungere ~max_chars sommando i contenuti.
+    Mantiene l'ordine e i ruoli, esclude eventuali messaggi 'system'.
+    """
+    sel = []
+    total = 0
+    for m in reversed(history_msgs):
+        if m.get("role") == "system":
+            continue
+        c = m.get("content") or ""
+        total += len(c)
+        sel.append(m)
+        if total >= max_chars:
+            break
+    return list(reversed(sel))
+
+# === THEME (nautico chiaro) & GLOBAL CSS ====================================
+def _nautical_css(pro_mode: bool = False) -> str:
+    if pro_mode:
+        # Alta leggibilità: contrasto alto, fondo bianco ghiaccio, bordi chiari
+        return """
+        <style>
+          @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@600;700&family=Inter:wght@400;600&display=swap');
+          :root{
+            --bg-top: #ffffff;
+            --bg-bottom: #f7fbff;
+            --fg: #0b1220;
+            --fg-muted: #273043;
+            --border: #d6e3f8;
+            --card: #ffffff;
+            --bubble: #f7faff;
+            --link: #0e7ddf;
+            --accent: #1e4ed8;
+            --input-bg: #ffffff;
+            --placeholder: #50627a;
+          }
+          [data-testid="stAppViewContainer"]{
+            background: linear-gradient(180deg, var(--bg-top) 0%, var(--bg-bottom) 100%);
+          }
+          [data-testid="stAppViewContainer"] .main .block-container{
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 18px;
+            box-shadow: 0 6px 26px rgba(15, 23, 42, .04);
+            padding: 1rem 1.25rem 1.5rem 1.25rem;
+          }
+          .main .block-container, .main .block-container p, .main .block-container li, 
+          .main .block-container label, .main .block-container h1, .main .block-container h2, .main .block-container h3{
+            color: var(--fg);
+            font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+          }
+          .brand-title{
+            font-family: 'Plus Jakarta Sans', Inter, system-ui;
+            font-weight: 700; letter-spacing: .2px;
+            font-size: clamp(24px, 3.6vw, 36px);
+            color: var(--fg);
+          }
+          .brand-sub{ color: var(--fg-muted); font-size: 14px; margin-top: .25rem; }
+          .hero-card{ border-radius: 16px; padding: 14px 18px; border: 1px solid var(--border); background: #fffffff6; }
+          .side-card{ border-radius: 16px; padding: 12px; border: 1px solid var(--border); background: #ffffff; display:flex;align-items:center;justify-content:center; aspect-ratio: 1.8/1; }
+          [data-testid="stChatMessage"] > div:first-child{
+            border-radius: 12px !important; border: 1px solid var(--border); background: var(--bubble);
+          }
+          [data-testid="stChatInput"] textarea{
+            background: var(--input-bg) !important; border: 1px solid var(--border) !important;
+            color: var(--fg) !important; caret-color: var(--accent) !important;
+          }
+          [data-testid="stChatInput"] textarea::placeholder{ color: var(--placeholder) !important; opacity: 1 !important; }
+          .stTextInput input, .stTextArea textarea{
+            background: var(--input-bg) !important; border: 1px solid var(--border) !important; color: var(--fg) !important;
+          }
+          .stTextInput input::placeholder, .stTextArea textarea::placeholder{ color: var(--placeholder) !important; opacity: 1 !important; }
+          .main .block-container a{ color: var(--link); text-decoration: none; }
+          .wave-wrap{height: 30px; overflow: hidden; margin-top: 6px;}
+          [data-testid="stChatMessage"] p, [data-testid="stMarkdownContainer"] p {
+            overflow-wrap: break-word; word-break: normal; white-space: pre-wrap;
+          }
+        </style>
+        """
+    else:
+        # Scenografico morbido
+        return """
+        <style>
+          @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@600;700&family=Inter:wght@400;600&display=swap');
+          :root{
+            --bg-top: #f7fbff;
+            --bg-bottom: #edf6ff;
+            --fg: #0f172a;
+            --fg-muted: #334155;
+            --border: #dbeafe;
+            --card: #ffffffee;
+            --bubble: #f8fbff;
+            --link: #0ea5e9;
+            --accent: #2563eb;
+            --input-bg: #ffffff;
+            --placeholder: #64748b;
+          }
+          [data-testid="stAppViewContainer"]{
+            background: linear-gradient(180deg, var(--bg-top) 0%, var(--bg-bottom) 100%);
+          }
+          [data-testid="stAppViewContainer"] .main .block-container{
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 18px;
+            box-shadow: 0 6px 26px rgba(15, 23, 42, .06);
+            padding: 1rem 1.25rem 1.5rem 1.25rem;
+          }
+          .main .block-container, .main .block-container p, .main .block-container li, 
+          .main .block-container label, .main .block-container h1, .main .block-container h2, .main .block-container h3{
+            color: var(--fg);
+            font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+          }
+          .brand-title{
+            font-family: 'Plus Jakarta Sans', Inter, system-ui;
+            font-weight: 700; letter-spacing: .2px;
+            font-size: clamp(26px, 4vw, 40px);
+            color: var(--fg);
+          }
+          .brand-sub{ color: var(--fg-muted); font-size: 14px; margin-top: .25rem; }
+          .hero-card{
+            border-radius: 16px; padding: 14px 18px; border: 1px solid var(--border);
+            background: #fffffff6; box-shadow: 0 8px 24px rgba(2,6,23,.06);
+          }
+          .side-card{
+            border-radius: 16px; padding: 12px; border: 1px solid var(--border);
+            background: #ffffffbf; display:flex;align-items:center;justify-content:center; aspect-ratio: 1.8/1;
+          }
+          [data-testid="stChatMessage"] > div:first-child{
+            border-radius: 12px !important; border: 1px solid var(--border); background: var(--bubble);
+          }
+          [data-testid="stChatInput"] textarea{
+            background: var(--input-bg) !important; border: 1px solid var(--border) !important;
+            color: var(--fg) !important; caret-color: var(--accent) !important;
+          }
+          [data-testid="stChatInput"] textarea::placeholder{ color: var(--placeholder) !important; opacity: 1 !important; }
+          .stTextInput input, .stTextArea textarea{
+            background: var(--input-bg) !important; border: 1px solid var(--border) !important; color: var(--fg) !important;
+          }
+          .stTextInput input::placeholder, .stTextArea textarea::placeholder{ color: var(--placeholder) !important; opacity: 1 !important; }
+          .main .block-container a{ color: var(--link); text-decoration: none; }
+          .wave-wrap{height: 36px; overflow: hidden; margin-top: 6px;}
+          [data-testid="stChatMessage"] p, [data-testid="stMarkdownContainer"] p {
+            overflow-wrap: break-word; word-break: normal; white-space: pre-wrap;
+          }
+        </style>
+        """
 
 def _sailboat_svg(width=220):
     return f"""
@@ -233,12 +317,19 @@ def _wave_svg(width="100%", height=36):
     </svg>
     """
 
-def render_hero() -> None:
-    st.markdown(_nautical_css(), unsafe_allow_html=True)
+def render_hero(high_readability: bool = False, logo_bytes: bytes | None = None) -> None:
+    st.markdown(_nautical_css(high_readability), unsafe_allow_html=True)
     c1, c2 = st.columns([1.2, 2.6])
     with c1:
         st.markdown('<div class="side-card">', unsafe_allow_html=True)
-        st.markdown(_sailboat_svg(240), unsafe_allow_html=True)
+        if logo_bytes:
+            try:
+                im = Image.open(BytesIO(logo_bytes))
+                st.image(im, use_column_width=True)
+            except Exception:
+                st.markdown(_sailboat_svg(240), unsafe_allow_html=True)
+        else:
+            st.markdown(_sailboat_svg(240), unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
     with c2:
         st.markdown(
@@ -252,18 +343,21 @@ def render_hero() -> None:
         )
         st.markdown(f'<div class="wave-wrap">{_wave_svg()}</div>', unsafe_allow_html=True)
 
-def warn_if_no_key():
-    if st.session_state["engine"] == "openai" and not os.getenv("OPENAI_API_KEY"):
-        st.warning("⚠️ OPENAI_API_KEY non trovato. Crea un file `.env` nella root del progetto.")
+def _warn_keys():
+    eng = st.session_state.get("engine", "openai")
+    if eng == "openai" and not os.getenv("OPENAI_API_KEY"):
+        st.warning("⚠️ OPENAI_API_KEY non trovato. Aggiungilo al file `.env`.")
+    if eng == "hugging" and not os.getenv("HUGGINGFACE_API_KEY"):
+        st.warning("⚠️ HUGGINGFACE_API_KEY non trovato. Inseriscilo in `.env`.")
 
 # 4) UI base
 st.set_page_config(page_title="GV_GPT — L’aria sta cambiando", page_icon="⛵", layout="wide")
-render_hero()
 
 # 5) Stato app e sidebar
 st.session_state.setdefault("persist", True)
 st.session_state.setdefault("engine", (os.getenv("GV_ENGINE", "openai") or "openai").lower())
 st.session_state.setdefault("openai_model", os.getenv("OPENAI_MODEL") or "gpt-4o-mini")
+st.session_state.setdefault("hf_model", os.getenv("HUGGINGFACE_MODEL") or "meta-llama/Meta-Llama-3.1-8B-Instruct")
 st.session_state.setdefault("ollama_model", os.getenv("OLLAMA_MODEL") or "phi3:3.8b")
 st.session_state.setdefault("ollama_base", os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434")
 st.session_state.setdefault("engine_lock", (os.getenv("GV_ENGINE_LOCK", "0").lower() in ("1","true","yes","on")))
@@ -272,14 +366,35 @@ st.session_state.setdefault("didactic", True)
 st.session_state.setdefault("thinking", False)
 st.session_state.setdefault("target_words", 800)
 st.session_state.setdefault("max_rounds", 4)
-st.session_state.setdefault("ollama_stream", True)
+st.session_state.setdefault("streaming_on", True)
+st.session_state.setdefault("high_readability", True)
+st.session_state.setdefault("logo_bytes", None)
+
+with st.sidebar:
+    st.header("⚙️ Aspetto")
+    st.session_state["high_readability"] = st.toggle("Alta leggibilità", value=st.session_state["high_readability"])
+    logo = st.file_uploader("Carica logo (PNG/JPG)", type=["png", "jpg", "jpeg"])
+    if logo is not None:
+        st.session_state["logo_bytes"] = logo.read()
+
+render_hero(high_readability=st.session_state["high_readability"], logo_bytes=st.session_state.get("logo_bytes"))
 
 with st.sidebar:
     st.header("🔀 Engine & Modelli")
 
-    eng_display = "OpenAI" if st.session_state["engine"] == "openai" else "Ollama"
-    engine_choice = st.radio("Seleziona engine:", ["OpenAI", "Ollama"], index=0 if eng_display == "OpenAI" else 1)
+    eng_display = (
+        "OpenAI" if st.session_state["engine"] == "openai"
+        else "HuggingFace" if st.session_state["engine"] == "hugging"
+        else "Ollama"
+    )
+    engine_choice = st.radio(
+        "Seleziona engine:",
+        ["OpenAI", "HuggingFace", "Ollama"],
+        index=0 if eng_display == "OpenAI" else (1 if eng_display == "HuggingFace" else 2),
+        horizontal=True
+    )
 
+    # OpenAI
     st.subheader("OpenAI")
     openai_suggestions = ["gpt-4o-mini", "gpt-4o", "o4-mini", "gpt-4.1-mini", "Custom…"]
     current_openai = st.session_state["openai_model"]
@@ -295,6 +410,15 @@ with st.sidebar:
     else:
         current_openai = openai_sel
 
+    # HuggingFace
+    st.subheader("HuggingFace (test)")
+    current_hf = st.text_input(
+        "Model (HF)",
+        value=st.session_state["hf_model"],
+        help="Esempi: meta-llama/Meta-Llama-3.1-8B-Instruct, mistralai/Mixtral-8x7B-Instruct-v0.1, google/gemma-2-9b-it"
+    )
+
+    # Ollama
     st.subheader("Ollama (locale)")
     base_val = st.text_input("Base URL", value=st.session_state["ollama_base"], help="Di solito http://localhost:11434")
     def _discover_ollama_models(base_url: str) -> list[str]:
@@ -320,22 +444,25 @@ with st.sidebar:
     else:
         current_ollama = ollama_sel
 
-    # 📝 Lunghezza risposta (num_predict) — controlla OLLAMA_NUM_PREDICT live
     st.header("📝 Lunghezza risposta (Ollama)")
     default_tok = int(os.getenv("OLLAMA_NUM_PREDICT", "900") or "900")
     tok = st.slider("Token di output max", 200, 1600, default_tok, help="Aumenta se la risposta si ferma a metà.")
     os.environ["OLLAMA_NUM_PREDICT"] = str(tok)
 
-    if st.button("✅ Applica & usa questi modelli"):
-        st.session_state["engine"] = "openai" if engine_choice == "OpenAI" else "ollama"
+    if st.button("✅ Applica"):
+        st.session_state["engine"] = "openai" if engine_choice == "OpenAI" else ("hugging" if engine_choice == "HuggingFace" else "ollama")
         st.session_state["openai_model"] = (current_openai or "gpt-4o-mini").strip()
+        st.session_state["hf_model"] = (current_hf or "meta-llama/Meta-Llama-3.1-8B-Instruct").strip()
         st.session_state["ollama_model"] = (current_ollama or "phi3:3.8b").strip()
         st.session_state["ollama_base"]  = (base_val or "http://localhost:11434").strip()
+
         os.environ["GV_ENGINE"]        = st.session_state["engine"]
         os.environ["OPENAI_MODEL"]     = st.session_state["openai_model"]
+        os.environ["HUGGINGFACE_MODEL"]= st.session_state["hf_model"]
         os.environ["OLLAMA_MODEL"]     = st.session_state["ollama_model"]
         os.environ["OLLAMA_BASE_URL"]  = st.session_state["ollama_base"]
-        st.success(f"Impostato: {engine_choice} • OpenAI={st.session_state['openai_model']} • Ollama={st.session_state['ollama_model']}")
+
+        st.success(f"Impostato: {engine_choice} • OpenAI={st.session_state['openai_model']} • HF={st.session_state['hf_model']} • Ollama={st.session_state['ollama_model']}")
         st.rerun()
 
     st.header("🔒 Lock engine")
@@ -345,15 +472,21 @@ with st.sidebar:
 
     st.header("🧠 Memoria")
     st.checkbox("Mantieni chat tra riavvii", key="persist")
-    if st.button("🗑️ Cancella memoria salvata"):
-        clear_memory()
-        st.success("Memoria persistente cancellata.")
+    cols_mem = st.columns(2)
+    with cols_mem[0]:
+        if st.button("🧹 Svuota chat"):
+            st.session_state.history = []
+            st.success("Chat svuotata.")
+    with cols_mem[1]:
+        if st.button("🗑️ Cancella memoria salvata"):
+            clear_memory()
+            st.success("Memoria persistente cancellata.")
 
     st.header("🎓 Modalità didattica")
     st.session_state["didactic"] = st.checkbox("Spiega passo-passo (sezioni, esempi, mini-quiz)", value=st.session_state["didactic"])
 
     st.header("🧠 Thinking (longform)")
-    st.session_state["thinking"] = st.checkbox("Attiva modalità lunga (continue-only)", value=st.session_state["thinking"])
+    st.session_state["thinking"] = st.checkbox("Attiva modalità lunga (continue-only su Ollama)", value=st.session_state["thinking"])
     target_label = st.select_slider(
         "Lunghezza desiderata",
         options=["~400 parole", "~800 parole", "~1200 parole", "~2000 parole"],
@@ -363,10 +496,10 @@ with st.sidebar:
     )
     target_words_map = {"~400 parole": 400, "~800 parole": 800, "~1200 parole": 1200, "~2000 parole": 2000}
     st.session_state["target_words"] = target_words_map[target_label]
-    st.session_state["max_rounds"] = st.slider("Max round (oltre il primo)", 0, 8, st.session_state["max_rounds"], help="Round extra di continuazione dopo il primo.")
+    st.session_state["max_rounds"] = st.slider("Max round extra", 0, 8, st.session_state["max_rounds"])
 
     st.header("⚡ Streaming")
-    st.session_state["ollama_stream"] = st.checkbox("Streaming live", value=st.session_state["ollama_stream"], help="Evita timeout e mostra i token in arrivo.")
+    st.session_state["streaming_on"] = st.checkbox("Streaming live (dove supportato)", value=st.session_state["streaming_on"])
 
     st.header("▶ Continua")
     has_chat_state = bool(st.session_state.get("history"))
@@ -399,11 +532,7 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"Diagnostica fallita: {e}")
 
-def warn_if_no_key():
-    if st.session_state["engine"] == "openai" and not os.getenv("OPENAI_API_KEY"):
-        st.warning("⚠️ OPENAI_API_KEY non trovato. Crea un file `.env` nella root del progetto.")
-
-warn_if_no_key()
+_warn_keys()
 
 # 6) Stato conversazione
 if "history" not in st.session_state:
@@ -427,8 +556,11 @@ def _update_outline_if_needed(full_text: str, every_round: int, round_idx: int, 
         {"role": "system", "content": system_text},
         {"role": "user", "content": ask}
     ]
-    outline = call_chat_smart(msgs, temperature=0.3)
-    st.session_state["outline"] = outline.strip()[:4000]
+    try:
+        outline = call_chat_smart(msgs, temperature=0.3)
+        st.session_state["outline"] = (outline or "").strip()[:4000]
+    except Exception as e:
+        log.warning(f"Outline update failed: {e}")
 
 # ---------- CONTINUE BUTTON ---------------------------------------------------
 if st.session_state.get("do_continue"):
@@ -448,8 +580,8 @@ if st.session_state.get("do_continue"):
                 round_words=600,
                 didactic=False,
             )
-            chunk = call_chat_smart(msgs, temperature=0.7)  # no-stream per applicare guardie
-            if _looks_restart(chunk) or _is_redundant(chunk, last_assistant_text) or _too_similar(chunk, last_assistant_text):
+            chunk = call_chat_smart(msgs, temperature=0.7)  # non-stream per applicare guardie
+            if _looks_restart(chunk) or _is_reduant(chunk, last_assistant_text) or _too_similar(chunk, last_assistant_text):
                 chunk = re.sub(r'(?is)^.{0,300}\n', '', chunk, count=1).strip()
             reply = (chunk or "").replace("<<FINE>>","").strip()
             st.markdown(reply if reply else "_(nessun avanzamento)_")
@@ -477,8 +609,10 @@ if user := st.chat_input("Scrivi qui…"):
     system_text = system_prompt_for_intent(intent)
     didactic_suffix = "\n\n[STILE DIDATTICO] Struttura a sezioni con titoli, definizioni chiare, esempi pratici e, alla fine, 3 domande quiz con risposte." if st.session_state.get("didactic", True) else ""
 
-    base_messages = [
-        {"role": "system", "content": system_text},
+    # History corta per non saturare contesto (specie con Ollama/HF)
+    short_history = _short_history_by_chars(st.session_state.history[:-1], max_chars=5000)
+
+    base_messages = [{"role": "system", "content": system_text}] + short_history + [
         {"role": "user", "content": enriched_user + didactic_suffix}
     ]
 
@@ -486,121 +620,67 @@ if user := st.chat_input("Scrivi qui…"):
         t0 = time.time()
         reply = ""
 
-        # --- THINKING LONGFORM con Ollama (continue-only) --------------------
-        if st.session_state["engine"] == "ollama" and st.session_state.get("thinking", False):
-            placeholder = st.empty()
-            acc = ""
-
-            # Primo output — streaming controllato via placeholder
-            try:
+        engine_now = st.session_state["engine"]
+        try:
+            if st.session_state.get("streaming_on", True):
+                # Streaming robusto via placeholder (NO st.write per token!)
+                placeholder = st.empty()
                 pieces = []
-                for delta in stream_chat(base_messages):
+                for delta in stream_chat(base_messages, model_override=(
+                    st.session_state["openai_model"] if engine_now == "openai"
+                    else st.session_state["hf_model"] if engine_now == "hugging"
+                    else st.session_state["ollama_model"]
+                )):
                     if not isinstance(delta, str):
                         continue
                     pieces.append(delta)
-                    acc = "".join(pieces)
-                    placeholder.markdown(acc)
-            except Exception as e:
-                acc = f"[Errore modello] {str(e).splitlines()[0]}"
-                placeholder.markdown(acc)
+                    text = "".join(pieces)
+                    placeholder.markdown(text)
+                reply = "".join(pieces).strip()
+                if not reply:
+                    raise RuntimeError("Nessun testo dallo stream")
+            else:
+                reply = call_chat(base_messages, model_override=(
+                    st.session_state["openai_model"] if engine_now == "openai"
+                    else st.session_state["hf_model"] if engine_now == "hugging"
+                    else st.session_state["ollama_model"]
+                ))
+                st.markdown(reply)
 
-            # Loop di continuazione
-            rounds = 0
-            budget = max(0, st.session_state["target_words"] - _word_count(acc))
-            restarts_in_row = 0
-
-            while rounds < st.session_state["max_rounds"] and budget > 0 and "<<FINE>>" not in acc:
+            # AUTO-CONTINUE: se si ferma a metà (Ollama) e non c'è <<FINE>>
+            if engine_now == "ollama" and _looks_cutoff(reply) and "<<FINE>>" not in reply:
                 msgs = build_continue_only_messages(
                     system_once=system_text,
                     history=[{"role":"user","content": enriched_user + didactic_suffix},
-                             {"role":"assistant","content": acc}],
-                    final_text_tail=_tail(acc, 1500),
-                    round_words=min(700, budget),
+                             {"role":"assistant","content": reply}],
+                    final_text_tail=_tail(reply, 1500),
+                    round_words=600,
                     didactic=st.session_state.get("didactic", False),
                 )
+                more = call_chat_smart(msgs, temperature=0.7)
+                if more and more.strip():
+                    more = more.replace("<<FINE>>", "").strip()
+                    reply = (reply + ("\n\n" if not reply.endswith("\n\n") else "") + more).strip()
+                    # aggiorna a schermo
+                    placeholder.markdown(reply)
+
+        except Exception as e:
+            if not st.session_state.get("engine_lock", False):
                 try:
-                    # non stream nel continue per applicare guardie
-                    chunk = call_chat_smart(msgs, temperature=0.7)
-                except Exception as e:
-                    chunk = f"\n[Errore modello] {str(e).splitlines()[0]}"
-
-                if not chunk or not str(chunk).strip():
-                    break
-
-                if _looks_restart(chunk) or _is_redundant(chunk, acc) or _too_similar(chunk, acc):
-                    restarts_in_row += 1
-                    if restarts_in_row >= 2:
-                        acc += "\n\n[⚠️ STOP_LOOP: rilevato riavvio/ripetizione eccessiva]"
-                        break
-                    else:
-                        chunk = re.sub(r'(?is)^.{0,300}\n', '', chunk, count=1).strip()
-                else:
-                    restarts_in_row = 0
-
-                acc += ("\n\n" if acc and not acc.endswith("\n\n") else "") + str(chunk).strip()
-                acc = acc.replace("<<FINE>>", "").strip()
-                placeholder.markdown(acc)
-
-                wrote = _word_count(chunk)
-                budget -= max(0, wrote)
-                rounds += 1
-
-                # aggiorna outline ogni 2 round
-                _update_outline_if_needed(acc, every_round=2, round_idx=rounds, system_text=system_text)
-
-            reply = acc.strip() or "_Nessuna risposta generata._"
-            st.markdown(reply)
-
-        # --- Turno normale (stream engine selezionato) ------------------------
-        else:
-            try:
-                if st.session_state.get("ollama_stream", True):
-                    # Streaming robusto via placeholder (NO st.write per token!)
-                    placeholder = st.empty()
-                    pieces = []
-                    for delta in stream_chat(base_messages):
-                        if not isinstance(delta, str):
-                            continue
-                        pieces.append(delta)
-                        text = "".join(pieces)
-                        placeholder.markdown(text)
-                    reply = "".join(pieces).strip()
-                    if not reply:
-                        raise RuntimeError("Nessun testo dallo stream")
-                else:
-                    reply = call_chat(base_messages)
+                    reply = call_chat_smart(base_messages, model_override=(
+                        st.session_state["openai_model"] if engine_now == "openai"
+                        else st.session_state["hf_model"] if engine_now == "hugging"
+                        else st.session_state["ollama_model"]
+                    ))
                     st.markdown(reply)
-
-                # AUTO-CONTINUE: se si ferma a metà frase e siamo su Ollama
-                if st.session_state["engine"] == "ollama" and _looks_cutoff(reply) and "<<FINE>>" not in reply:
-                    msgs = build_continue_only_messages(
-                        system_once=system_text,
-                        history=[{"role":"user","content": enriched_user + didactic_suffix},
-                                 {"role":"assistant","content": reply}],
-                        final_text_tail=_tail(reply, 1500),
-                        round_words=600,
-                        didactic=st.session_state.get("didactic", False),
-                    )
-                    more = call_chat_smart(msgs, temperature=0.7)
-                    if more and more.strip():
-                        more = more.replace("<<FINE>>", "").strip()
-                        reply = (reply + ("\n\n" if not reply.endswith("\n\n") else "") + more).strip()
-                        # aggiorna a schermo
-                        placeholder.markdown(reply)
-
-            except Exception as e:
-                if not st.session_state.get("engine_lock", False):
-                    try:
-                        reply = call_chat_smart(base_messages)
-                        st.markdown(reply)
-                    except Exception as e2:
-                        reply = f"⚠️ Errore modello: {str(e2).splitlines()[0]}"
-                        st.markdown(reply)
-                else:
-                    reply = f"⚠️ Errore modello: {str(e).splitlines()[0]}"
+                except Exception as e2:
+                    reply = f"⚠️ Errore modello: {str(e2).splitlines()[0]}"
                     st.markdown(reply)
+            else:
+                reply = f"⚠️ Errore modello: {str(e).splitlines()[0]}"
+                st.markdown(reply)
 
-        log.info(f"ENGINE={st.session_state['engine']} THINKING={st.session_state.get('thinking', False)} ELAPSED={time.time()-t0:.1f}s")
+        log.info(f"ENGINE={engine_now} THINKING={st.session_state.get('thinking', False)} ELAPSED={time.time()-t0:.1f}s")
 
     # Accoda risposta e salva memoria
     st.session_state.history.append({"role": "assistant", "content": reply})
