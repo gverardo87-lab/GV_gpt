@@ -90,9 +90,10 @@ def _default_options(
     else:
         opts["stop"] = ["Introduzione", "Capitolo", "In questa risposta", "<<FINE>>"]
 
-    # override extra kwargs
-    for k,v in kw.items():
-        opts[k] = v
+    # Override extra kwargs (evita override con None)
+    for k, v in kw.items():
+        if v is not None:
+            opts[k] = v
     return opts
 
 # --- HTTP helpers -----------------------------------------------------------
@@ -122,8 +123,18 @@ def call_ollama_chat(
     Chiamata non-stream a /api/chat. Ritorna il testo finale come stringa.
     """
     mdl = _model_name(model)
-    opts = _default_options(num_predict=num_predict, num_ctx=num_ctx, temperature=temperature,
-                            stop=stop, keep_alive=keep_alive, **(options or {}), **kw)
+    # DEDUP: se una chiave è presente in options/kw, non ripassarla come argomento nominato
+    _extra = {k: v for k, v in {**(options or {}), **kw}.items() if v is not None}
+    _named = {
+        "num_predict": num_predict,
+        "num_ctx": num_ctx,
+        "temperature": temperature,
+        "stop": stop,
+        "keep_alive": keep_alive,
+    }
+    _base = {k: v for k, v in _named.items() if (v is not None and k not in _extra)}
+    opts = _default_options(**_base, **_extra)
+
     payload = {
         "model": mdl,
         "messages": messages,
@@ -157,8 +168,18 @@ def stream_ollama_chat(
     Emette pezzi di testo (delta). Gestisce heartbeat (spazi) se nessun token arriva per un po'.
     """
     mdl = _model_name(model)
-    opts = _default_options(num_predict=num_predict, num_ctx=num_ctx, temperature=temperature,
-                            stop=stop, keep_alive=keep_alive, **(options or {}), **kw)
+    # DEDUP come sopra
+    _extra = {k: v for k, v in {**(options or {}), **kw}.items() if v is not None}
+    _named = {
+        "num_predict": num_predict,
+        "num_ctx": num_ctx,
+        "temperature": temperature,
+        "stop": stop,
+        "keep_alive": keep_alive,
+    }
+    _base = {k: v for k, v in _named.items() if (v is not None and k not in _extra)}
+    opts = _default_options(**_base, **_extra)
+
     payload = {
         "model": mdl,
         "messages": messages,
@@ -216,8 +237,18 @@ def call_ollama_generate(
     Se debug=True, ritorna (testo, diagnostica).
     """
     mdl = _model_name(model)
-    opts = _default_options(num_predict=num_predict, num_ctx=num_ctx, temperature=temperature,
-                            stop=stop, keep_alive=keep_alive, **(options or {}), **kw)
+    # DEDUP come sopra
+    _extra = {k: v for k, v in {**(options or {}), **kw}.items() if v is not None}
+    _named = {
+        "num_predict": num_predict,
+        "num_ctx": num_ctx,
+        "temperature": temperature,
+        "stop": stop,
+        "keep_alive": keep_alive,
+    }
+    _base = {k: v for k, v in _named.items() if (v is not None and k not in _extra)}
+    opts = _default_options(**_base, **_extra)
+
     payload = {
         "model": mdl,
         "prompt": prompt,
