@@ -18,25 +18,55 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Any, Dict, Generator, Iterable, List, Optional
+from typing import Any, Dict, Generator, List, Optional
 
 import requests
 
 # ---- Import motori locali ---------------------------------------------------
-from core.ollama_client import (
-    call_ollama_chat,
-    stream_ollama_chat,
-)
+try:
+    from core.ollama_client import call_ollama_chat, stream_ollama_chat
+except Exception as _e:
+    # Lasciare import lazy: il progetto può non includere Ollama
+    call_ollama_chat = None  # type: ignore
+    stream_ollama_chat = None  # type: ignore
 
-# Mid-tier di test (Hugging Face Inference API)
-from core.hugging_client import call_hugging_chat  # nuovo client
+try:
+    from core.hugging_client import call_hugging_chat  # non-stream
+except Exception as _e:
+    call_hugging_chat = None  # type: ignore
 
 # Re-export helper per longform "continue-only"
 try:
-    from core.context import build_continue_only_messages  # re-export
+    from core.context import build_continue_only_messages  # re-export se presente
 except Exception:
-    def build_continue_only_messages(*args, **kwargs):
-        raise RuntimeError("build_continue_only_messages non disponibile (core/context.py mancante).")
+    # Fallback robusto: costruisce un prompt "continua da qui" senza introdurre ripetizioni
+    def build_continue_only_messages(
+        *,
+        system_once: str,
+        history: List[Dict[str, str]],
+        final_text_tail: str,
+        round_words: int = 600,
+        didactic: bool = False,
+    ) -> List[Dict[str, str]]:
+        """
+        Costruisce i messaggi per proseguire una generazione lunga senza riassunti o re-introduzioni.
+        - system_once: system prompt da porre in testa una sola volta
+        - history: cronologia messaggi precedente (user/assistant)
+        - final_text_tail: gli ultimi caratteri prodotti (per dare continuità)
+        - round_words: target parole per il blocco successivo
+        - didactic: se True, mantiene uno stile didattico con esempi pratici
+        """
+        tail = (final_text_tail or "").strip()
+        guard = (
+            "Continua esattamente dal punto in cui il testo si è interrotto, "
+            "senza riassunti, senza introduzioni (niente 'Introduzione', 'Capitolo', 'In questa risposta'). "
+            f"Scrivi circa {round_words} parole e prosegui lineare. "
+        )
+        if didactic:
+            guard += "Mantieni stile didattico con esempi pratici. "
+        guard += "Chiudi con <<FINE>> solo se completi la sezione corrente."
+        user_prompt = (tail + ("\n\n" if tail else "") + guard).strip()
+        return [{"role": "system", "content": system_once}] + history + [{"role": "user", "content": user_prompt}]
 
 # ============================== Utilities ====================================
 
@@ -46,9 +76,6 @@ def _env(name: str, default: Optional[str] = None) -> Optional[str]:
 
 def _is_true(value: Optional[str]) -> bool:
     return (value or "").lower() in ("1", "true", "yes", "on")
-
-def _now_ms() -> int:
-    return int(time.time() * 1000)
 
 # ============================== OpenAI client ================================
 
@@ -205,6 +232,8 @@ def call_chat(
         )
 
     if engine == "hugging":
+        if call_hugging_chat is None:
+            raise RuntimeError("Modulo Hugging Face non disponibile.")
         # Non-stream: Hugging Face Inference API
         return call_hugging_chat(
             messages,
@@ -216,8 +245,10 @@ def call_chat(
         )
 
     if engine == "ollama":
+        if call_ollama_chat is None:
+            raise RuntimeError("Modulo Ollama non disponibile.")
         # /api/chat (non-stream)
-        options = {}
+        options: Dict[str, Any] = {}
         # opzionale: parametri di generazione possono essere passati in options
         if kwargs.get("temperature") is not None:
             options["temperature"] = float(kwargs["temperature"])
@@ -228,7 +259,6 @@ def call_chat(
         return call_ollama_chat(
             messages=messages,
             model=model_override or None,
-            base_url=os.getenv("OLLAMA_BASE_URL"),
             options=options or None,
             timeout=kwargs.get("timeout"),
         )
@@ -257,6 +287,8 @@ def stream_chat(
         )
 
     if engine == "hugging":
+        if call_hugging_chat is None:
+            raise RuntimeError("Modulo Hugging Face non disponibile.")
         txt = call_hugging_chat(
             messages,
             model=os.getenv("HUGGINGFACE_MODEL"),
@@ -271,7 +303,9 @@ def stream_chat(
         return _gen()
 
     if engine == "ollama":
-        options = {}
+        if stream_ollama_chat is None:
+            raise RuntimeError("Modulo Ollama non disponibile.")
+        options: Dict[str, Any] = {}
         if kwargs.get("temperature") is not None:
             options["temperature"] = float(kwargs["temperature"])
         if kwargs.get("top_p") is not None:
@@ -281,7 +315,6 @@ def stream_chat(
         return stream_ollama_chat(
             messages=messages,
             model=model_override or None,
-            base_url=os.getenv("OLLAMA_BASE_URL"),
             options=options or None,
             timeout=kwargs.get("timeout"),
         )
@@ -299,7 +332,7 @@ def call_chat_smart(
     Chiamata "intelligente" con fallback multi-engine se GV_ENGINE_LOCK è OFF.
     Strategia:
       - Prova engine corrente.
-      - Se engine=openai e l'errore indica 429/quota/limit -> prova hugging.
+      - Se engine=openai e l'errore è quota/rate limit -> prova hugging.
       - Altrimenti prova ollama.
     Se GV_ENGINE_LOCK è ON -> ripropaga l'errore del primo tentativo.
     """
