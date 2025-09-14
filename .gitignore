@@ -44,3 +44,8 @@ Thumbs.db
 # === Secrets ===
 .env
 .env.local
+.venv/
+data/nlp_logs.jsonl
+data/intent_model.pkl
+logs/
+__pycache__/

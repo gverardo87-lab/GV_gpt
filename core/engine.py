@@ -26,20 +26,24 @@ import requests
 try:
     from core.ollama_client import call_ollama_chat, stream_ollama_chat
 except Exception as _e:
-    # Lasciare import lazy: il progetto può non includere Ollama
     call_ollama_chat = None  # type: ignore
     stream_ollama_chat = None  # type: ignore
 
 try:
-    from core.hugging_client import call_hugging_chat  # non-stream
+    from core.hugging_client import call_hugging_chat
 except Exception as _e:
     call_hugging_chat = None  # type: ignore
 
+# NEW: usa gpt_clienti come client unico per OpenAI
+try:
+    from core import gpt_clienti
+except Exception:
+    gpt_clienti = None
+
 # Re-export helper per longform "continue-only"
 try:
-    from core.context import build_continue_only_messages  # re-export se presente
+    from core.context import build_continue_only_messages
 except Exception:
-    # Fallback robusto: costruisce un prompt "continua da qui" senza introdurre ripetizioni
     def build_continue_only_messages(
         *,
         system_once: str,
@@ -48,14 +52,6 @@ except Exception:
         round_words: int = 600,
         didactic: bool = False,
     ) -> List[Dict[str, str]]:
-        """
-        Costruisce i messaggi per proseguire una generazione lunga senza riassunti o re-introduzioni.
-        - system_once: system prompt da porre in testa una sola volta
-        - history: cronologia messaggi precedente (user/assistant)
-        - final_text_tail: gli ultimi caratteri prodotti (per dare continuità)
-        - round_words: target parole per il blocco successivo
-        - didactic: se True, mantiene uno stile didattico con esempi pratici
-        """
         tail = (final_text_tail or "").strip()
         guard = (
             "Continua esattamente dal punto in cui il testo si è interrotto, "
@@ -80,7 +76,6 @@ def _is_true(value: Optional[str]) -> bool:
 # ============================== OpenAI client ================================
 
 def _openai_base_url() -> str:
-    # Supporta override (es. proxy) via OPENAI_BASE_URL; default API ufficiale
     return (_env("OPENAI_BASE_URL", "https://api.openai.com/v1") or "https://api.openai.com/v1").rstrip("/")
 
 def _openai_model() -> str:
@@ -126,6 +121,7 @@ def _parse_openai_stream_line(raw_line: bytes) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
+# MODIFICATO: ora usa gpt_clienti.call_gpt_chat se disponibile
 def _call_openai_nonstream(
     messages: List[Dict[str, str]],
     model: Optional[str] = None,
@@ -134,6 +130,9 @@ def _call_openai_nonstream(
     top_p: Optional[float] = None,
     timeout: Optional[int] = None,
 ) -> str:
+    if gpt_clienti is not None:
+        return gpt_clienti.call_gpt_chat(messages, temperature=temperature or 0.7)
+
     url = _openai_base_url() + "/chat/completions"
     headers = _openai_headers()
     payload: Dict[str, Any] = {
@@ -157,13 +156,12 @@ def _call_openai_nonstream(
     resp = _with_retry(_do_post)
     resp.raise_for_status()
     data = resp.json() if resp.content else {}
-    # OpenAI: choices[0].message.content
     try:
         return (data["choices"][0]["message"]["content"] or "").strip()
     except Exception:
-        # fallback testuale per debug
         return json.dumps(data, ensure_ascii=False)
 
+# MODIFICATO: ora usa gpt_clienti.stream_gpt_chat se disponibile
 def _stream_openai(
     messages: List[Dict[str, str]],
     model: Optional[str] = None,
@@ -172,6 +170,9 @@ def _stream_openai(
     top_p: Optional[float] = None,
     timeout: Optional[int] = None,
 ) -> Generator[str, None, None]:
+    if gpt_clienti is not None:
+        return gpt_clienti.stream_gpt_chat(messages, temperature=temperature or 0.7)
+
     url = _openai_base_url() + "/chat/completions"
     headers = _openai_headers()
     payload: Dict[str, Any] = {
@@ -210,14 +211,7 @@ def _stream_openai(
 
 # ============================== Public API ===================================
 
-def call_chat(
-    messages: List[Dict[str, str]],
-    **kwargs,
-) -> str:
-    """
-    Chiamata non-stream. Route sull'engine scelto via GV_ENGINE.
-    kwargs supportati: temperature, max_tokens, top_p, timeout, model_override
-    """
+def call_chat(messages: List[Dict[str, str]], **kwargs) -> str:
     engine = (_env("GV_ENGINE", "openai") or "openai").lower()
     model_override = kwargs.get("model") or kwargs.get("model_override")
 
@@ -234,7 +228,6 @@ def call_chat(
     if engine == "hugging":
         if call_hugging_chat is None:
             raise RuntimeError("Modulo Hugging Face non disponibile.")
-        # Non-stream: Hugging Face Inference API
         return call_hugging_chat(
             messages,
             model=os.getenv("HUGGINGFACE_MODEL"),
@@ -247,9 +240,7 @@ def call_chat(
     if engine == "ollama":
         if call_ollama_chat is None:
             raise RuntimeError("Modulo Ollama non disponibile.")
-        # /api/chat (non-stream)
         options: Dict[str, Any] = {}
-        # opzionale: parametri di generazione possono essere passati in options
         if kwargs.get("temperature") is not None:
             options["temperature"] = float(kwargs["temperature"])
         if kwargs.get("top_p") is not None:
@@ -265,14 +256,7 @@ def call_chat(
 
     raise RuntimeError(f"Engine non supportato: {engine}")
 
-def stream_chat(
-    messages: List[Dict[str, str]],
-    **kwargs,
-) -> Generator[str, None, None]:
-    """
-    Streaming. Per Hugging Face (no streaming) restituiamo un generatore che
-    emette tutto in un solo yield (pseudo-stream).
-    """
+def stream_chat(messages: List[Dict[str, str]], **kwargs) -> Generator[str, None, None]:
     engine = (_env("GV_ENGINE", "openai") or "openai").lower()
     model_override = kwargs.get("model") or kwargs.get("model_override")
 
@@ -321,25 +305,13 @@ def stream_chat(
 
     def _empty():
         if False:
-            yield ""  # pragma: no cover
+            yield ""
     return _empty()
 
-def call_chat_smart(
-    messages: List[Dict[str, str]],
-    **kwargs,
-) -> str:
-    """
-    Chiamata "intelligente" con fallback multi-engine se GV_ENGINE_LOCK è OFF.
-    Strategia:
-      - Prova engine corrente.
-      - Se engine=openai e l'errore è quota/rate limit -> prova hugging.
-      - Altrimenti prova ollama.
-    Se GV_ENGINE_LOCK è ON -> ripropaga l'errore del primo tentativo.
-    """
+def call_chat_smart(messages: List[Dict[str, str]], **kwargs) -> str:
     lock = _is_true(os.getenv("GV_ENGINE_LOCK", "0"))
     current = (_env("GV_ENGINE", "openai") or "openai").lower()
 
-    # 1) tenta engine corrente
     try:
         return call_chat(messages, **kwargs)
     except Exception as e1:
@@ -347,7 +319,6 @@ def call_chat_smart(
             raise
         err = str(e1).lower()
 
-        # 2) se siamo su OpenAI e l'errore è quota/rate limit -> HuggingFace
         if current == "openai" and any(k in err for k in ("429", "quota", "insufficient", "rate limit")):
             try:
                 os.environ["GV_ENGINE"] = "hugging"
@@ -357,12 +328,10 @@ def call_chat_smart(
             finally:
                 os.environ["GV_ENGINE"] = current
 
-        # 3) ultima rete di sicurezza: Ollama
         try:
             os.environ["GV_ENGINE"] = "ollama"
             return call_chat(messages, **kwargs)
         except Exception:
-            # ripristina e rilancia l'errore iniziale
             os.environ["GV_ENGINE"] = current
             raise e1
         finally:
@@ -374,5 +343,5 @@ __all__ = [
     "call_chat",
     "stream_chat",
     "call_chat_smart",
-    "build_continue_only_messages",  # re-export
+    "build_continue_only_messages",
 ]
