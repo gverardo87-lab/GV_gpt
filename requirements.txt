@@ -7,3 +7,4 @@ openai
 ollama
 huggingface_hub
 requests
+python-dotenv==1.1.1

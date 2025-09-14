@@ -11,12 +11,31 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # 0) Ponte: assicura che la root del progetto sia nel PYTHONPATH
-import sys, pathlib
-ROOT = pathlib.Path(__file__).resolve().parents[1]
+import sys
+from pathlib import Path
+
+def find_project_root(start: Path | None = None) -> Path:
+    start = start or Path(__file__).resolve()
+    cur = start if start.is_dir() else start.parent
+    for _ in range(7):
+        if (cur / "data").exists() and (cur / "nlp_layer").exists():
+            return cur
+        cur = cur.parent
+    return Path(__file__).resolve().parent  # fallback
+
+ROOT = find_project_root()
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 # 1) Env & imports base
+try:
+    from dotenv import load_dotenv
+except Exception:
+    load_dotenv = None
+
+if load_dotenv:
+    load_dotenv(ROOT / ".env")
+
 import os
 import json
 import time
@@ -24,9 +43,6 @@ import re
 import difflib
 from datetime import datetime
 from io import BytesIO
-
-from dotenv import load_dotenv
-load_dotenv(ROOT / ".env")
 
 # --- Boot Guard (anti-mix progetti) ------------------------------------------
 try:
@@ -82,13 +98,52 @@ except Exception:
 
 log = get_logger()
 
+# --- (NUOVO) Percorsi log supervisioni + writer robusto ----------------------
+from datetime import datetime as _dt_for_log  # alias per non confliggere
+import hashlib as _hashlib_for_log
+
+DATA = ROOT / "data"
+LOG_FILE = DATA / "nlp_logs.jsonl"
+
+_last_sig = None
+_last_sig_at = 0.0
+
+def write_nlp_log(payload: dict):
+    """
+    Scrive su data/nlp_logs.jsonl e ritorna (ok: bool, err: str|None).
+    - timestamp coerenti: 'ts' epoch + 'time' ISO8601
+    - anti-duplicato entro 2s (mitiga i rerun Streamlit)
+    """
+    try:
+        DATA.mkdir(parents=True, exist_ok=True)
+        safe = dict(payload or {})
+        ts = time.time()
+        safe.setdefault("ts", ts)
+        safe["time"] = _dt_for_log.fromtimestamp(ts).isoformat()
+        line = json.dumps(safe, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+        global _last_sig, _last_sig_at
+        sig = _hashlib_for_log.sha1(line.encode("utf-8")).hexdigest()
+        if _last_sig == sig and (ts - _last_sig_at) < 2.0:
+            return True, None  # duplicato evitato → ok
+
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
+
+        _last_sig, _last_sig_at = sig, ts
+        return True, None
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
 # --- Sanitizer / Post-processor anti drift -----------------------------------
 # 1) Rimuove token stile LLM (<|...|>) e direttive tra [] (INTENT, ecc.)
 META_RX = re.compile(
     r"(?is)(<\|[^>]*\|>"
     r"|\[(?:INTENT|EXPLICIT[\s_-]*ACTION[\s_-]*LIST)[^\]]*\]"
     r"|\[[A-Z][A-Z0-9 _-]{2,}:[^\]]*\]"
-    r"|\[[A-Z][A-Z0-9 _-]{2,}\])"  # es. [STILE DIDATTICO]
+    r"|\[[A-Z][A-Z0-9 _-]{2,}\])"
 )
 def _sanitize_meta(s: str) -> str:
     if not s:
@@ -103,7 +158,7 @@ def _strip_drift_prefix(text: str) -> str:
     out = DRIFT_PREFIX_RX.sub("", text).lstrip()
     return out if out else text
 
-# 3) Sopprime righe “Your task: … / Instruction: … / Begin by …” ovunque compaiano
+# 3) Sopprime righe “Your task … / Instruction … / Begin by …”
 DRIFT_LINES_RX = re.compile(r"(?im)^\s*(your\s+task|instruction|begin\s+by)\s*:\s.*$")
 def _strip_drift_lines(text: str) -> str:
     if not text:
@@ -177,10 +232,6 @@ def _looks_cutoff(txt: str) -> bool:
     return not re.search(r'[.!?…]"?\s*\Z', txt.strip())
 
 def _short_history_by_chars(history_msgs: list, max_chars: int = 9000) -> list:
-    """
-    Ritorna la coda della history fino a raggiungere ~max_chars sommando i contenuti.
-    Mantiene l'ordine e i ruoli, esclude eventuali messaggi 'system'.
-    """
     sel = []
     total = 0
     for m in reversed(history_msgs):
@@ -196,7 +247,6 @@ def _short_history_by_chars(history_msgs: list, max_chars: int = 9000) -> list:
 # === THEME (nautico chiaro) & GLOBAL CSS ====================================
 def _nautical_css(pro_mode: bool = False) -> str:
     if pro_mode:
-        # Alta leggibilità: contrasto alto, fondo bianco ghiaccio, bordi chiari
         return """
         <style>
           @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@600;700&family=Inter:wght@400;600&display=swap');
@@ -213,114 +263,67 @@ def _nautical_css(pro_mode: bool = False) -> str:
             --input-bg: #ffffff;
             --placeholder: #50627a;
           }
-          [data-testid="stAppViewContainer"]{
-            background: linear-gradient(180deg, var(--bg-top) 0%, var(--bg-bottom) 100%);
-          }
+          [data-testid="stAppViewContainer"]{ background: linear-gradient(180deg, var(--bg-top) 0%, var(--bg-bottom) 100%); }
           [data-testid="stAppViewContainer"] .main .block-container{
-            background: var(--card);
-            border: 1px solid var(--border);
-            border-radius: 18px;
-            box-shadow: 0 6px 26px rgba(15, 23, 42, .04);
-            padding: 1rem 1.25rem 1.5rem 1.25rem;
+            background: var(--card); border: 1px solid var(--border); border-radius: 18px;
+            box-shadow: 0 6px 26px rgba(15, 23, 42, .04); padding: 1rem 1.25rem 1.5rem 1.25rem;
           }
           .main .block-container, .main .block-container p, .main .block-container li, 
           .main .block-container label, .main .block-container h1, .main .block-container h2, .main .block-container h3{
-            color: var(--fg);
-            font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+            color: var(--fg); font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
           }
-          .brand-title{
-            font-family: 'Plus Jakarta Sans', Inter, system-ui;
-            font-weight: 700; letter-spacing: .2px;
-            font-size: clamp(24px, 3.6vw, 36px);
-            color: var(--fg);
-          }
+          .brand-title{ font-family: 'Plus Jakarta Sans', Inter, system-ui; font-weight: 700; letter-spacing: .2px;
+            font-size: clamp(24px, 3.6vw, 36px); color: var(--fg); }
           .brand-sub{ color: var(--fg-muted); font-size: 14px; margin-top: .25rem; }
           .hero-card{ border-radius: 16px; padding: 14px 18px; border: 1px solid var(--border); background: #fffffff6; }
-          .side-card{ border-radius: 16px; padding: 12px; border: 1px solid var(--border); background: #ffffff; display:flex;align-items:center;justify-content:center; aspect-ratio: 1.8/1; }
-          [data-testid="stChatMessage"] > div:first-child{
-            border-radius: 12px !important; border: 1px solid var(--border); background: var(--bubble);
-          }
+          .side-card{ border-radius: 16px; padding: 12px; border: 1px solid var(--border); background: #ffffff;
+            display:flex;align-items:center;justify-content:center; aspect-ratio: 1.8/1; }
+          [data-testid="stChatMessage"] > div:first-child{ border-radius: 12px !important; border: 1px solid var(--border); background: var(--bubble); }
           [data-testid="stChatInput"] textarea{
             background: var(--input-bg) !important; border: 1px solid var(--border) !important;
             color: var(--fg) !important; caret-color: var(--accent) !important;
           }
           [data-testid="stChatInput"] textarea::placeholder{ color: var(--placeholder) !important; opacity: 1 !important; }
-          .stTextInput input, .stTextArea textarea{
-            background: var(--input-bg) !important; border: 1px solid var(--border) !important; color: var(--fg) !important;
-          }
+          .stTextInput input, .stTextArea textarea{ background: var(--input-bg) !important; border: 1px solid var(--border) !important; color: var(--fg) !important; }
           .stTextInput input::placeholder, .stTextArea textarea::placeholder{ color: var(--placeholder) !important; opacity: 1 !important; }
           .main .block-container a{ color: var(--link); text-decoration: none; }
           .wave-wrap{height: 30px; overflow: hidden; margin-top: 6px;}
-          [data-testid="stChatMessage"] p, [data-testid="stMarkdownContainer"] p {
-            overflow-wrap: break-word; word-break: normal; white-space: pre-wrap;
-          }
+          [data-testid="stChatMessage"] p, [data-testid="stMarkdownContainer"] p { overflow-wrap: break-word; white-space: pre-wrap; }
         </style>
         """
     else:
-        # Scenografico morbido
         return """
         <style>
           @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@600;700&family=Inter:wght@400;600&display=swap');
           :root{
-            --bg-top: #f7fbff;
-            --bg-bottom: #edf6ff;
-            --fg: #0f172a;
-            --fg-muted: #334155;
-            --border: #dbeafe;
-            --card: #ffffffee;
-            --bubble: #f8fbff;
-            --link: #0ea5e9;
-            --accent: #2563eb;
-            --input-bg: #ffffff;
-            --placeholder: #64748b;
+            --bg-top: #f7fbff; --bg-bottom: #edf6ff; --fg: #0f172a; --fg-muted: #334155; --border: #dbeafe;
+            --card: #ffffffee; --bubble: #f8fbff; --link: #0ea5e9; --accent: #2563eb; --input-bg: #ffffff; --placeholder: #64748b;
           }
-          [data-testid="stAppViewContainer"]{
-            background: linear-gradient(180deg, var(--bg-top) 0%, var(--bg-bottom) 100%);
-          }
+          [data-testid="stAppViewContainer"]{ background: linear-gradient(180deg, var(--bg-top) 0%, var(--bg-bottom) 100%); }
           [data-testid="stAppViewContainer"] .main .block-container{
-            background: var(--card);
-            border: 1px solid var(--border);
-            border-radius: 18px;
-            box-shadow: 0 6px 26px rgba(15, 23, 42, .06);
+            background: var(--card); border: 1px solid var(--border); border-radius: 18px; box-shadow: 0 8px 24px rgba(2,6,23,.06);
             padding: 1rem 1.25rem 1.5rem 1.25rem;
           }
           .main .block-container, .main .block-container p, .main .block-container li, 
           .main .block-container label, .main .block-container h1, .main .block-container h2, .main .block-container h3{
-            color: var(--fg);
-            font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+            color: var(--fg); font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
           }
-          .brand-title{
-            font-family: 'Plus Jakarta Sans', Inter, system-ui;
-            font-weight: 700; letter-spacing: .2px;
-            font-size: clamp(26px, 4vw, 40px);
-            color: var(--fg);
-          }
+          .brand-title{ font-family: 'Plus Jakarta Sans', Inter, system-ui; font-weight: 700; letter-spacing: .2px;
+            font-size: clamp(26px, 4vw, 40px); color: var(--fg); }
           .brand-sub{ color: var(--fg-muted); font-size: 14px; margin-top: .25rem; }
-          .hero-card{
-            border-radius: 16px; padding: 14px 18px; border: 1px solid var(--border);
-            background: #fffffff6; box-shadow: 0 8px 24px rgba(2,6,23,.06);
-          }
-          .side-card{
-            border-radius: 16px; padding: 12px; border: 1px solid var(--border);
-            background: #ffffffbf; display:flex;align-items:center;justify-content:center; aspect-ratio: 1.8/1;
-          }
-          [data-testid="stChatMessage"] > div:first-child{
-            border-radius: 12px !important; border: 1px solid var(--border); background: var(--bubble);
-          }
+          .hero-card{ border-radius: 16px; padding: 14px 18px; border: 1px solid var(--border); background: #fffffff6; box-shadow: 0 8px 24px rgba(2,6,23,.06); }
+          .side-card{ border-radius: 16px; padding: 12px; border: 1px solid var(--border); background: #ffffffbf;
+            display:flex;align-items:center;justify-content:center; aspect-ratio: 1.8/1; }
+          [data-testid="stChatMessage"] > div:first-child{ border-radius: 12px !important; border: 1px solid var(--border); background: var(--bubble); }
           [data-testid="stChatInput"] textarea{
-            background: var(--input-bg) !important; border: 1px solid var(--border) !important;
-            color: var(--fg) !important; caret-color: var(--accent) !important;
+            background: var(--input-bg) !important; border: 1px solid var(--border) !important; color: var(--fg) !important; caret-color: var(--accent) !important;
           }
           [data-testid="stChatInput"] textarea::placeholder{ color: var(--placeholder) !important; opacity: 1 !important; }
-          .stTextInput input, .stTextArea textarea{
-            background: var(--input-bg) !important; border: 1px solid var(--border) !important; color: var(--fg) !important;
-          }
+          .stTextInput input, .stTextArea textarea{ background: var(--input-bg) !important; border: 1px solid var(--border) !important; color: var(--fg) !important; }
           .stTextInput input::placeholder, .stTextArea textarea::placeholder{ color: var(--placeholder) !important; opacity: 1 !important; }
           .main .block-container a{ color: var(--link); text-decoration: none; }
           .wave-wrap{height: 36px; overflow: hidden; margin-top: 6px;}
-          [data-testid="stChatMessage"] p, [data-testid="stMarkdownContainer"] p {
-            overflow-wrap: break-word; word-break: normal; white-space: pre-wrap;
-          }
+          [data-testid="stChatMessage"] p, [data-testid="stMarkdownContainer"] p { overflow-wrap: break-word; white-space: pre-wrap; }
         </style>
         """
 
@@ -407,6 +410,7 @@ st.session_state.setdefault("max_rounds", 4)
 st.session_state.setdefault("streaming_on", True)
 st.session_state.setdefault("high_readability", True)
 st.session_state.setdefault("logo_bytes", None)
+st.session_state.setdefault("corr_snapshot", None)  # ⬅️ NUOVO: snapshot ultimo input+pred
 
 with st.sidebar:
     st.header("⚙️ Aspetto")
@@ -648,7 +652,7 @@ if st.session_state.get("do_continue"):
 
 # 8) Input utente (turno normale)
 if user := st.chat_input("Scrivi qui…"):
-    # Sanitizza subito l'input per evitare drift (marker/meta-tag)
+    # Sanitizza subito l'input per evitare drift
     san_user = _sanitize_meta(user)
 
     st.session_state.history.append({"role": "user", "content": san_user})
@@ -659,10 +663,20 @@ if user := st.chat_input("Scrivi qui…"):
     with st.expander("🔎 NLP insight", expanded=False):
         st.write(nlp_data)
 
+    # >>> NUOVO: salviamo snapshot dell'ULTIMO input + predizione (PERSISTE tra i rerun)
+    _pred = str(nlp_data.get("intent", "general") or "general")
+    _score = float(nlp_data.get("score", 0.0) or 0.0)
+    st.session_state["corr_snapshot"] = {
+        "text": san_user,
+        "predicted_intent": _pred,
+        "predicted_score": _score,
+    }
+    st.caption("🖊️ Puoi correggere l'intent di questo messaggio nel pannello in fondo alla pagina.")
+
     engine_now = st.session_state.get("engine", "openai")
     # Prompt arricchito (di default)
     enriched_user = compose_prompt(san_user, nlp_data)
-    # ⛳ Su OLLAMA inviamo SOLO la domanda pulita (evita trigger “Instruction” del dataset)
+    # Su OLLAMA inviamo SOLO la domanda pulita
     if engine_now == "ollama":
         enriched_user = san_user
 
@@ -675,7 +689,7 @@ if user := st.chat_input("Scrivi qui…"):
         if st.session_state.get("didactic", True) else ""
     )
 
-    # History corta per non saturare contesto (specie con Ollama/HF) + sanitizzazione
+    # History corta + sanitizzazione
     short_history = _short_history_by_chars(st.session_state.history[:-1], max_chars=9000)
     short_history = [{"role": m["role"], "content": _sanitize_meta(m.get("content",""))} for m in short_history]
 
@@ -689,7 +703,6 @@ if user := st.chat_input("Scrivi qui…"):
 
         try:
             if st.session_state.get("streaming_on", True):
-                # Streaming robusto via placeholder (NO st.write per token!)
                 placeholder = st.empty()
                 pieces = []
                 for delta in stream_chat(base_messages, model_override=(
@@ -697,12 +710,10 @@ if user := st.chat_input("Scrivi qui…"):
                     else st.session_state["hf_model"] if engine_now == "hugging"
                     else st.session_state["ollama_model"]
                 )):
-                    # Filtra heartbeat/whitespace per evitare "spazi fantasma"
                     if not isinstance(delta, str) or not delta.strip():
                         continue
                     pieces.append(delta)
                     text = "".join(pieces)
-                    # Post-process live: togli prefissi/righe “Instruction/Your task/Begin by”
                     text = _strip_drift_lines(_strip_drift_prefix(text))
                     placeholder.markdown(text)
                 reply = "".join(pieces).strip()
@@ -731,7 +742,6 @@ if user := st.chat_input("Scrivi qui…"):
                 if more and more.strip():
                     more = more.replace("<<FINE>>", "").strip()
                     reply = (reply + ("\n\n" if not reply.endswith("\n\n") else "") + more).strip()
-                    # aggiorna a schermo
                     if st.session_state.get("streaming_on", True):
                         placeholder.markdown(reply)
                     else:
@@ -756,7 +766,59 @@ if user := st.chat_input("Scrivi qui…"):
 
         log.info(f"ENGINE={engine_now} THINKING={st.session_state.get('thinking', False)} ELAPSED={time.time()-t0:.1f}s")
 
-    # Accoda risposta e salva memoria
     st.session_state.history.append({"role": "assistant", "content": reply})
     if st.session_state.get("persist", True):
         save_memory(st.session_state.history)
+
+# === PANNELLO PERSISTENTE: Correzione intent dell’ultimo messaggio ===========
+st.divider()
+st.subheader("🖊️ Correzione intent dell’ultimo messaggio")
+
+_snapshot = st.session_state.get("corr_snapshot")
+if not _snapshot:
+    st.caption("Invia un messaggio: qui potrai correggerne l'intent.")
+else:
+    _text = _snapshot.get("text") or ""
+    _pred = _snapshot.get("predicted_intent") or "general"
+    _score = float(_snapshot.get("predicted_score") or 0.0)
+    st.write(f"**Testo:** “{_text[:160]}{'…' if len(_text)>160 else ''}”")
+    st.write(f"**Predetto:** `{_pred}` — confidenza: {_score:.2f}")
+
+    _labels = ["coding","business","nutrition","calendar","study","health","motivation","finance","science","general"]
+    try:
+        _default_idx = _labels.index(_pred)
+    except Exception:
+        _default_idx = _labels.index("general")
+
+    _corr = st.selectbox("Seleziona l'intent corretto", _labels, index=_default_idx, key="corr_global_select")
+    if st.button("💾 Salva correzione intent", key="corr_global_save"):
+        ok, err = write_nlp_log({
+            "text": _text,
+            "predicted_intent": _pred,
+            "predicted_score": _score,
+            "correct_intent": _corr,
+            "source": "streamlit_correction"
+        })
+        if ok:
+            st.success("Correzione salvata nei log.")
+        else:
+            st.error(f"Correzione NON salvata: {err}")
+        st.caption(f"File log correzioni: `{LOG_FILE}`")
+
+    # Expander: vedere subito le ultime correzioni
+    with st.expander("🗂️ Correzioni recenti (streamlit_correction)"):
+        try:
+            st.caption(f"Percorso log: `{LOG_FILE}`")
+            rows = []
+            if LOG_FILE.exists():
+                with open(LOG_FILE, "r", encoding="utf-8") as f:
+                    lines = [ln for ln in f if '"source":"streamlit_correction"' in ln]
+                    for ln in lines[-10:]:
+                        obj = json.loads(ln)
+                        rows.append(
+                            f"- `{obj.get('correct_intent')}` ← \"{(obj.get('text') or '')[:100]}\"  "
+                            f"(pred: {obj.get('predicted_intent')} {obj.get('predicted_score')})"
+                        )
+            st.markdown("\n".join(rows) if rows else "_Nessuna correzione salvata ancora._")
+        except Exception as _e:
+            st.info(f"Log non leggibile: {_e}")
