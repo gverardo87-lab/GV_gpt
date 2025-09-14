@@ -3,6 +3,10 @@
 venv/
 env/
 
+# === Secrets ===
+.env
+.env.local
+
 # === Byte-compiled / cache ===
 __pycache__/
 *.py[cod]
@@ -30,22 +34,22 @@ htmlcov/
 .pytype/
 .pyre/
 
-# === Logs ===
+# === Logs & runtime artifacts ===
 logs/
 *.log
-data/
+
+# Keep only source datasets; ignore runtime in data/
+data/*
+!data/intent_examples.json
+!data/memory_default.json
+!data/.gitkeep
+!data/README.md
+
+# === Streamlit ===
+.streamlit/
 
 # === IDE / OS ===
 .idea/
 .vscode/
 .DS_Store
 Thumbs.db
-
-# === Secrets ===
-.env
-.env.local
-.venv/
-data/nlp_logs.jsonl
-data/intent_model.pkl
-logs/
-__pycache__/
