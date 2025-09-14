@@ -20,10 +20,13 @@ def load_memory():
         return []
     try:
         data = json.loads(MEM_FILE.read_text(encoding="utf-8"))
-        if isinstance(data, list) and all(_is_msg_ok(x) for x in data):
-            return data[-MAX_TURNS:]
+        if isinstance(data, list):
+            # 🔧 Patch: filtra i messaggi validi, ignora i corrotti
+            valid = [m for m in data if _is_msg_ok(m)]
+            return valid[-MAX_TURNS:]
     except Exception:
-        pass
+        # se il file è completamente illeggibile → reset
+        return []
     return []
 
 def save_memory(messages):
