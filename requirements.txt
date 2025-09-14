@@ -1,0 +1,9 @@
+streamlit
+python-dotenv
+sentence-transformers
+scikit-learn
+joblib
+openai
+ollama
+huggingface_hub
+requests
