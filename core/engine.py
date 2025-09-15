@@ -257,6 +257,12 @@ def call_chat(messages: List[Dict[str, str]], **kwargs) -> str:
     raise RuntimeError(f"Engine non supportato: {engine}")
 
 def stream_chat(messages: List[Dict[str, str]], **kwargs) -> Generator[str, None, None]:
+    """
+    Streaming unificato. Supporta per Ollama:
+      - should_stop (callable opzionale) per hard-stop immediato
+      - idle_timeout (float, env OLLAMA_IDLE_TIMEOUT default 8s)
+      - heartbeat_sec (float, env OLLAMA_HEARTBEAT_SEC default 2s)
+    """
     engine = (_env("GV_ENGINE", "openai") or "openai").lower()
     model_override = kwargs.get("model") or kwargs.get("model_override")
 
@@ -296,11 +302,21 @@ def stream_chat(messages: List[Dict[str, str]], **kwargs) -> Generator[str, None
             options["top_p"] = float(kwargs["top_p"])
         if kwargs.get("max_tokens") is not None:
             options["num_predict"] = int(kwargs["max_tokens"])
+
+        # ⬇️ Nuovi parametri pass-through per stop/timeout
+        should_stop = kwargs.get("should_stop")
+        idle_timeout = float(_env("OLLAMA_IDLE_TIMEOUT", "8") or "8")
+        heartbeat_sec = float(_env("OLLAMA_HEARTBEAT_SEC", "2") or "2")
+
         return stream_ollama_chat(
             messages=messages,
             model=model_override or None,
             options=options or None,
             timeout=kwargs.get("timeout"),
+            # nuovi argomenti
+            idle_timeout=kwargs.get("idle_timeout", idle_timeout),
+            heartbeat_sec=kwargs.get("heartbeat_sec", heartbeat_sec),
+            should_stop=should_stop,
         )
 
     def _empty():

@@ -12,11 +12,13 @@
 #   OLLAMA_NUM_PREDICT=512
 #   OLLAMA_NUM_CTX=3072
 #   OLLAMA_NUM_THREAD= (opzionale)
+#   OLLAMA_CONNECT_TIMEOUT=10
+#   OLLAMA_READ_TIMEOUT=180
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
 import os, json, time
-from typing import Iterable, List, Dict, Any, Optional, Generator
+from typing import Iterable, List, Dict, Any, Optional, Generator, Callable
 import requests
 
 # --- Defaults ---------------------------------------------------------------
@@ -49,7 +51,7 @@ def _default_options(
     mirostat_tau: Optional[float] = 5.0,
     mirostat_eta: Optional[float] = 0.1,
     stop: Optional[List[str]] = None,
-    keep_alive: Optional[str] = "5m",
+    keep_alive: Optional[str] = "15s",   # ridotto (prima 5m)
     seed: Optional[int] = None,
     num_thread: Optional[int] = None,
     **kw: Any,
@@ -97,11 +99,43 @@ def _default_options(
     return opts
 
 # --- HTTP helpers -----------------------------------------------------------
-def _post(path: str, payload: Dict[str, Any], timeout: int | float = 120, stream: bool = False) -> requests.Response:
+def _mk_timeout(timeout: int | float | tuple[int, int] | tuple[float, float] | None) -> tuple[float, float]:
+    """
+    Rende sempre (connect_timeout, read_timeout).
+    - Se timeout è None → default: 10s connessione, 180s lettura (overridabili via env).
+    - Se è numero → (10s, timeout).
+    - Se è tupla → cast a float di entrambi gli elementi.
+    - Se è stringa convertibile → trattala come numero (read timeout).
+    """
+    def _envf(name: str, default: str) -> float:
+        try:
+            return float(os.getenv(name, default))
+        except Exception:
+            return float(default)
+
+    if timeout is None:
+        return (_envf("OLLAMA_CONNECT_TIMEOUT", "10"), _envf("OLLAMA_READ_TIMEOUT", "180"))
+
+    if isinstance(timeout, tuple) and len(timeout) == 2:
+        a, b = timeout
+        return (float(a), float(b))
+
+    try:
+        # int/float o stringa numerica
+        return (_envf("OLLAMA_CONNECT_TIMEOUT", "10"), float(timeout))
+    except Exception:
+        # fallback sicuro
+        return (10.0, 180.0)
+
+def _post(path: str, payload: Dict[str, Any], timeout: int | float | tuple[int, int] | None = 120, stream: bool = False) -> requests.Response:
     url = f"{_base_url()}{path}"
-    headers = {"Content-Type": "application/json"}
-    # timeout può essere float o (conn, read)
-    tout = timeout if isinstance(timeout, (int, float)) else 120
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/x-ndjson" if stream else "application/json",
+        "Connection": "close",  # non tenere connessioni appese
+    }
+    tout = _mk_timeout(timeout)
+    # NB: usiamo data=json.dumps per evitare ambiguità su float/None
     resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=tout, stream=stream)
     return resp
 
@@ -113,9 +147,9 @@ def call_ollama_chat(
     temperature: float = 0.7,
     num_predict: Optional[int] = None,
     num_ctx: Optional[int] = None,
-    timeout: int | float = 180,
+    timeout: int | float | tuple[int, int] | None = 180,
     stop: Optional[List[str]] = None,
-    keep_alive: str = "5m",
+    keep_alive: str = "15s",
     options: Optional[Dict[str, Any]] = None,
     **kw: Any,
 ) -> str:
@@ -141,9 +175,10 @@ def call_ollama_chat(
         "stream": False,
         "options": opts,
     }
-    resp = _post("/api/chat", payload, timeout=timeout, stream=False)
-    resp.raise_for_status()
-    data = resp.json()
+    # ⬇️ chiusura garantita della connessione
+    with _post("/api/chat", payload, timeout=timeout, stream=False) as resp:
+        resp.raise_for_status()
+        data = resp.json()
     # formato: {"message":{"role":"assistant","content":"..."}, "done":true, ...}
     msg = data.get("message") or {}
     content = msg.get("content") or ""
@@ -156,16 +191,19 @@ def stream_ollama_chat(
     temperature: float = 0.7,
     num_predict: Optional[int] = None,
     num_ctx: Optional[int] = None,
-    timeout: int | float = 240,
+    timeout: int | float | tuple[int, int] | None = 240,
     stop: Optional[List[str]] = None,
-    keep_alive: str = "5m",
+    keep_alive: str = "15s",
     options: Optional[Dict[str, Any]] = None,
     heartbeat_sec: float = 2.0,
+    idle_timeout: float = 8.0,                      # tronca se non arrivano token
+    should_stop: Optional[Callable[[], bool]] = None,  # stop esterno (facoltativo)
     **kw: Any,
 ) -> Generator[str, None, None]:
     """
     Streaming generator da /api/chat.
-    Emette pezzi di testo (delta). Gestisce heartbeat (spazi) se nessun token arriva per un po'.
+    Emette pezzi di testo (delta). Gestisce heartbeat (vuoti) e idle-timeout.
+    Se should_stop è fornito e ritorna True, interrompe immediatamente lo stream.
     """
     mdl = _model_name(model)
     # DEDUP come sopra
@@ -188,29 +226,45 @@ def stream_ollama_chat(
     }
     start = time.time()
     last_yield = start
+    last_token = start
+
     try:
-        resp = _post("/api/chat", payload, timeout=timeout, stream=True)
-        resp.raise_for_status()
-        for line in resp.iter_lines(decode_unicode=True):
-            if not line:
-                # heartbeat per evitare timeouts UI; emetti uno spazio raramente
-                if (time.time() - last_yield) > heartbeat_sec:
-                    yield ""
-                    last_yield = time.time()
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if obj.get("error"):
-                yield f"\n[Errore Ollama] {obj['error']}\n"
-                return
-            delta = ((obj.get("message") or {}).get("content")) or ""
-            if delta:
-                yield delta
-                last_yield = time.time()
-            if obj.get("done"):
-                return
+        # ⬇️ context manager per chiudere SEMPRE la connessione
+        with _post("/api/chat", payload, timeout=timeout, stream=True) as resp:
+            resp.raise_for_status()
+            for line in resp.iter_lines(decode_unicode=True, delimiter="\n"):
+                # stop esterno richiesto?
+                if should_stop and should_stop():
+                    break
+
+                now = time.time()
+                if not line:
+                    # heartbeat verso UI
+                    if (now - last_yield) > heartbeat_sec:
+                        yield ""
+                        last_yield = now
+                    # idle-timeout: nessun token per un po'
+                    if (now - last_token) > idle_timeout:
+                        break
+                    continue
+
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if obj.get("error"):
+                    yield f"\n[Errore Ollama] {obj['error']}\n"
+                    break
+
+                # nuovo token
+                delta = ((obj.get("message") or {}).get("content")) or ""
+                if delta:
+                    yield delta
+                    last_yield = last_token = now
+
+                if obj.get("done") is True:
+                    break
     except requests.exceptions.ReadTimeout:
         yield "\n[Errore Ollama] read timeout durante lo streaming.\n"
     except Exception as e:
@@ -224,9 +278,9 @@ def call_ollama_generate(
     temperature: float = 0.7,
     num_predict: Optional[int] = None,
     num_ctx: Optional[int] = None,
-    timeout: int | float = 180,
+    timeout: int | float | tuple[int, int] | None = 180,
     stop: Optional[List[str]] = None,
-    keep_alive: str = "5m",
+    keep_alive: str = "15s",
     options: Optional[Dict[str, Any]] = None,
     stream: bool = False,
     debug: bool = False,
@@ -259,31 +313,31 @@ def call_ollama_generate(
     try:
         t0 = time.time()
         if stream:
-            resp = _post("/api/generate", payload, timeout=timeout, stream=True)
-            resp.raise_for_status()
-            out = []
-            for line in resp.iter_lines(decode_unicode=True):
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if obj.get("error"):
-                    raise RuntimeError(obj["error"])
-                piece = obj.get("response") or ""
-                if piece:
-                    out.append(piece)
-                if obj.get("done"):
-                    break
+            with _post("/api/generate", payload, timeout=timeout, stream=True) as resp:
+                resp.raise_for_status()
+                out = []
+                for line in resp.iter_lines(decode_unicode=True, delimiter="\n"):
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if obj.get("error"):
+                        raise RuntimeError(obj["error"])
+                    piece = obj.get("response") or ""
+                    if piece:
+                        out.append(piece)
+                    if obj.get("done"):
+                        break
             text = "".join(out)
             diag["status"] = 200
             diag["t"]["elapsed"] = round(time.time() - t0, 3)
         else:
-            resp = _post("/api/generate", payload, timeout=timeout, stream=False)
-            diag["status"] = resp.status_code
-            resp.raise_for_status()
-            data = resp.json()
+            with _post("/api/generate", payload, timeout=timeout, stream=False) as resp:
+                diag["status"] = resp.status_code
+                resp.raise_for_status()
+                data = resp.json()
             text = data.get("response") or ""
             diag["t"]["elapsed"] = round(time.time() - t0, 3)
     except Exception as e:

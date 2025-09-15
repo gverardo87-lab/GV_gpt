@@ -41,7 +41,8 @@
     "Come risolvo bug intermittente in Java?",
     "Mi spieghi la differenza tra OOP in TypeScript?",
     "Mi spieghi la differenza tra generatori in C++?",
-    "Puoi mostrarmi un esempio di parlare con un'API REST con commenti?"
+    "Puoi mostrarmi un esempio di parlare con un'API REST con commenti?",
+    "mi puoi creare un minicorso di unix?"
   ],
   "business": [
     "Come calcolare il AOV per un e‑commerce",
@@ -380,7 +381,8 @@
     "come funziona campo magnetico terrestre",
     "Esempi pratici per comprendere linee di forza",
     "spiegami linee di forza",
-    "perché tempeste geomagnetiche"
+    "perché tempeste geomagnetiche",
+    "come si fa un piano di carico di una nave container?"
   ],
   "general": [
     "Ciao, cosa puoi fare per me?",
@@ -402,6 +404,7 @@
     "Quali sono i tuoi limiti?",
     "Puoi adattarti al mio stile?",
     "Che differenza c'è tra te e un motore di ricerca?",
-    "Ok, procediamo"
+    "Ok, procediamo",
+    "Domani vorrei fare una gita di un giorno vicino Genova, vista mare: 2 opzioni con percorso, costi indicativi e dove pranzare"
   ]
 }

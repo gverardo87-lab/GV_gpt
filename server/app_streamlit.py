@@ -371,6 +371,21 @@ def _wave_svg(width="100%", height=36):
     </svg>
     """
 
+# ── NEW: bussola animata durante l'elaborazione ──────────────────────────────
+def _compass_spinner(msg: str = "Sto pensando..."):
+    return f"""
+    <div style="display:flex;align-items:center;gap:10px;padding:6px 4px;">
+      <svg width="28" height="28" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <circle cx="50" cy="50" r="45" fill="none" stroke="#93c5fd" stroke-width="6" opacity=".6"/>
+        <polygon points="50,20 44,52 50,58 56,52" fill="#1e40af">
+          <animateTransform attributeName="transform" type="rotate" from="0 50 50" to="360 50 50" dur="1.6s" repeatCount="indefinite"/>
+        </polygon>
+        <circle cx="50" cy="50" r="4" fill="#1e3a8a"/>
+      </svg>
+      <span style="font:600 14px/1.2 'Inter',system-ui;color:#0f172a;">{msg}</span>
+    </div>
+    """
+
 def render_hero(high_readability: bool = False, logo_bytes: bytes | None = None) -> None:
     st.markdown(_nautical_css(high_readability), unsafe_allow_html=True)
     c1, c2 = st.columns([1.2, 2.6])
@@ -379,7 +394,8 @@ def render_hero(high_readability: bool = False, logo_bytes: bytes | None = None)
         if logo_bytes:
             try:
                 im = Image.open(BytesIO(logo_bytes))
-                st.image(im, use_column_width=True)
+                # DEPRECATION FIX: use_container_width
+                st.image(im, use_container_width=True)
             except Exception:
                 st.markdown(_sailboat_svg(240), unsafe_allow_html=True)
         else:
@@ -427,8 +443,10 @@ st.session_state.setdefault("streaming_on", True)
 st.session_state.setdefault("high_readability", True)
 st.session_state.setdefault("logo_bytes", None)
 st.session_state.setdefault("corr_snapshot", None)  # snapshot ultimo input+pred
-st.session_state.setdefault("topic_cut_idx", 0)     # ⬅️ NUOVO: indice da cui considerare il contesto
-st.session_state.setdefault("last_intent", "general")  # ⬅️ NUOVO: ultimo intent visto
+st.session_state.setdefault("topic_cut_idx", 0)     # indice da cui considerare il contesto
+st.session_state.setdefault("last_intent", "general")  # ultimo intent visto
+# NEW: stop forzato (UI)
+st.session_state.setdefault("stop_generation", False)
 
 with st.sidebar:
     st.header("⚙️ Aspetto")
@@ -565,6 +583,10 @@ with st.sidebar:
 
     st.header("⚡ Streaming")
     st.session_state["streaming_on"] = st.checkbox("Streaming live (dove supportato)", value=st.session_state["streaming_on"])
+    # NEW: stop forzato
+    if st.button("🛑 Stop generazione (forza stop)"):
+        st.session_state["stop_generation"] = True
+        st.toast("Interruzione richiesta", icon="🛑")
 
     st.header("▶ Continua")
     has_chat_state = bool(st.session_state.get("history"))
@@ -648,6 +670,9 @@ if st.session_state.get("do_continue"):
     with st.chat_message("assistant"):
         t0 = time.time()
         reply = ""
+        # Spinner visivo finché non arriva output
+        spin = st.empty()
+        spin.markdown(_compass_spinner("Sto generando la continuazione…"), unsafe_allow_html=True)
         try:
             msgs = build_continue_only_messages(
                 system_once=system_text,
@@ -658,6 +683,7 @@ if st.session_state.get("do_continue"):
                 didactic=False,
             )
             chunk = call_chat_smart(msgs, temperature=0.7)  # non-stream per applicare guardie
+            spin.empty()
             # Anti-drift/apology/Instruction
             chunk = _strip_drift_lines(_strip_drift_prefix(chunk))
             if _looks_restart(chunk) or _is_reduant(chunk, san_last_assistant) or _too_similar(chunk, san_last_assistant):
@@ -685,6 +711,7 @@ if st.session_state.get("do_continue"):
                     pass
 
         except Exception as e:
+            spin.empty()
             reply = "⚠️ Errore (continua): " + str(e).split("\n")[0]
             st.markdown(reply)
         log.info(f"CONTINUE elapsed={time.time()-t0:.1f}s")
@@ -700,6 +727,10 @@ if user := st.chat_input("Scrivi qui…"):
 
     st.session_state.history.append({"role": "user", "content": san_user})
     log.info(f"USER: {san_user}")
+
+    # Echo immediato in chat per evitare effetto “sparizione”
+    with st.chat_message("user"):
+        st.markdown(san_user)
 
     # NLP + orchestrator
     nlp_data = analyze_text(san_user)
@@ -771,33 +802,56 @@ if user := st.chat_input("Scrivi qui…"):
     with st.chat_message("assistant"):
         t0 = time.time()
         reply = ""
+        # Spinner + placeholder output
+        spinner = st.empty()
+        spinner_shown = True
+        spinner.markdown(_compass_spinner("Sto generando la risposta…"), unsafe_allow_html=True)
+        out = st.empty()
 
         try:
             if st.session_state.get("streaming_on", True):
-                placeholder = st.empty()
                 pieces = []
+                last = time.time()
                 for delta in stream_chat(base_messages, model_override=(
                     st.session_state["openai_model"] if engine_now == "openai"
                     else st.session_state["hf_model"] if engine_now == "hugging"
                     else st.session_state["ollama_model"]
                 )):
+                    # STOP forzato dalla UI
+                    if st.session_state.get("stop_generation"):
+                        st.session_state["stop_generation"] = False
+                        break
+
+                    now = time.time()
+                    # hard-timeout anti-zombie: se per 8s non arrivano token → esci
+                    if now - last > 8:
+                        break
+
                     if not isinstance(delta, str) or not delta.strip():
                         continue
+                    last = now
                     pieces.append(delta)
                     text = "".join(pieces)
                     text = _strip_drift_lines(_strip_drift_prefix(text))
-                    placeholder.markdown(text)
+
+                    if spinner_shown:
+                        spinner.empty()
+                        spinner_shown = False
+                    out.markdown(text)
+
                 reply = "".join(pieces).strip()
                 if not reply:
                     raise RuntimeError("Nessun testo dallo stream")
             else:
-                reply = call_chat(base_messages, model_override=(
+                tmp = call_chat(base_messages, model_override=(
                     st.session_state["openai_model"] if engine_now == "openai"
                     else st.session_state["hf_model"] if engine_now == "hugging"
                     else st.session_state["ollama_model"]
                 ))
-                reply = _strip_drift_lines(_strip_drift_prefix(reply))
-                st.markdown(reply)
+                reply = _strip_drift_lines(_strip_drift_prefix(tmp))
+                spinner.empty()
+                spinner_shown = False
+                out.markdown(reply)
 
             # AUTO-CONTINUE: se si ferma a metà (Ollama) e non c'è <<FINE>>
             if engine_now == "ollama" and _looks_cutoff(reply) and "<<FINE>>" not in reply:
@@ -813,10 +867,7 @@ if user := st.chat_input("Scrivi qui…"):
                 if more and more.strip():
                     more = more.replace("<<FINE>>", "").strip()
                     reply = (reply + ("\n\n" if not reply.endswith("\n\n") else "") + more).strip()
-                    if st.session_state.get("streaming_on", True):
-                        placeholder.markdown(reply)
-                    else:
-                        st.markdown(reply)
+                    out.markdown(reply)
 
             # PATCH C: repair-pass se output rumoroso (Ollama)
             if engine_now == "ollama" and _looks_noisy(reply):
@@ -833,14 +884,16 @@ if user := st.chat_input("Scrivi qui…"):
                     fixed = call_chat_smart(msgs_fix, temperature=0.2)
                     if fixed and len(fixed.strip()) > 120:
                         reply = fixed.strip()
-                        if st.session_state.get("streaming_on", True):
-                            placeholder.markdown(reply)
-                        else:
-                            st.markdown(reply)
+                        out.markdown(reply)
                 except Exception:
                     pass
 
         except Exception as e:
+            try:
+                if spinner_shown:
+                    spinner.empty()
+            except Exception:
+                pass
             if not st.session_state.get("engine_lock", False):
                 try:
                     reply = call_chat_smart(base_messages, model_override=(
@@ -849,13 +902,13 @@ if user := st.chat_input("Scrivi qui…"):
                         else st.session_state["ollama_model"]
                     ))
                     reply = _strip_drift_lines(_strip_drift_prefix(reply))
-                    st.markdown(reply)
+                    out.markdown(reply)
                 except Exception as e2:
                     reply = f"⚠️ Errore modello: {str(e2).splitlines()[0]}"
-                    st.markdown(reply)
+                    out.markdown(reply)
             else:
                 reply = f"⚠️ Errore modello: {str(e).splitlines()[0]}"
-                st.markdown(reply)
+                out.markdown(reply)
 
         log.info(f"ENGINE={engine_now} THINKING={st.session_state.get('thinking', False)} ELAPSED={time.time()-t0:.1f}s")
 
