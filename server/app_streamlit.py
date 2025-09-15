@@ -8,6 +8,7 @@
 # - Memoria persistente, export, diagnostica, slider num_predict e temperatura per Ollama
 # - Toggle “Alta leggibilità” per passare da scenografico a pro
 # - Sanitizer anti meta-marker + filtri anti drift (“Instruction/Your task/Begin by”)
+# - Topic fence: isola il contesto quando cambia argomento
 # ─────────────────────────────────────────────────────────────────────────────
 
 # 0) Ponte: assicura che la root del progetto sia nel PYTHONPATH
@@ -164,6 +165,18 @@ def _strip_drift_lines(text: str) -> str:
     if not text:
         return text
     return DRIFT_LINES_RX.sub("", text)
+
+# --- PATCH B: Rilevatore di “rumore” in output (maiuscole in mezzo, caps lunghi, parole mostro)
+NOISE_UPPER_RX   = re.compile(r"[a-zà-öø-ÿ]{2,}[A-Z]{2,}[a-zà-öø-ÿ]{2,}")
+LONG_ALLCAPS_RX  = re.compile(r"\b[A-Z]{10,}\b")
+VERYLONG_RX      = re.compile(r"\b[\wÀ-ÿ]{28,}\b")
+def _looks_noisy(text: str) -> bool:
+    if not text or len(text) < 120:
+        return False
+    bad = (len(NOISE_UPPER_RX.findall(text))
+           + len(LONG_ALLCAPS_RX.findall(text))
+           + len(VERYLONG_RX.findall(text)))
+    return bad >= 3
 
 # ==== Export helpers ==========================================================
 def export_chat_md(history: list) -> str:
@@ -394,6 +407,9 @@ def _warn_keys():
 # 4) UI base
 st.set_page_config(page_title="GV_GPT — L’aria sta cambiando", page_icon="⛵", layout="wide")
 
+# --- Topic fence: soglia per riconoscere un cambio argomento dagli intent ---
+INTENT_SWITCH_THR = float(os.getenv("INTENT_SWITCH_THR", "0.5"))
+
 # 5) Stato app e sidebar
 st.session_state.setdefault("persist", True)
 st.session_state.setdefault("engine", (os.getenv("GV_ENGINE", "openai") or "openai").lower())
@@ -410,7 +426,9 @@ st.session_state.setdefault("max_rounds", 4)
 st.session_state.setdefault("streaming_on", True)
 st.session_state.setdefault("high_readability", True)
 st.session_state.setdefault("logo_bytes", None)
-st.session_state.setdefault("corr_snapshot", None)  # ⬅️ NUOVO: snapshot ultimo input+pred
+st.session_state.setdefault("corr_snapshot", None)  # snapshot ultimo input+pred
+st.session_state.setdefault("topic_cut_idx", 0)     # ⬅️ NUOVO: indice da cui considerare il contesto
+st.session_state.setdefault("last_intent", "general")  # ⬅️ NUOVO: ultimo intent visto
 
 with st.sidebar:
     st.header("⚙️ Aspetto")
@@ -616,7 +634,12 @@ if st.session_state.get("do_continue"):
     engine_now = st.session_state.get("engine", "openai")
     system_text = system_prompt_for_intent("general")
     if engine_now == "ollama":
-        system_text += " Mantieni rigorosamente la lingua italiana per tutta la risposta; non passare a inglese o spagnolo. Se accade, correggiti e torna subito all'italiano."
+        # PATCH A: regole più strette per lingua/stile (Ollama)
+        system_text += (
+            " Rispondi esclusivamente in italiano semplice e corretto. "
+            "Evita parole inventate, sigle casuali e MAIUSCOLE nel mezzo delle parole; non usare inglese. "
+            "Se non sei sicuro, rispondi in modo conciso senza riempitivi."
+        )
 
     # Sanitize degli ultimi turni
     san_last_user = _sanitize_meta(last_user_text)
@@ -641,6 +664,26 @@ if st.session_state.get("do_continue"):
                 chunk = re.sub(r'(?is)^.{0,300}\n', '', chunk, count=1).strip()
             reply = (chunk or "").replace("<<FINE>>","").strip()
             st.markdown(reply if reply else "_(nessun avanzamento)_")
+
+            # PATCH C: repair-pass se output rumoroso (Ollama)
+            if engine_now == "ollama" and _looks_noisy(reply):
+                guard_sys = (
+                    "Sei un editor. Riscrivi il testo seguente in italiano chiaro e corretto "
+                    "in 5–8 frasi, eliminando parole inventate, sigle casuali e parti senza senso. "
+                    "Se qualcosa è scorretto o non verificabile, omettilo. Non usare inglese."
+                )
+                msgs_fix = [
+                    {"role": "system", "content": guard_sys},
+                    {"role": "user", "content": "TESTO DA RISCRIVERE:\n\n" + reply}
+                ]
+                try:
+                    fixed = call_chat_smart(msgs_fix, temperature=0.2)
+                    if fixed and len(fixed.strip()) > 120:
+                        reply = fixed.strip()
+                        st.markdown(reply)
+                except Exception:
+                    pass
+
         except Exception as e:
             reply = "⚠️ Errore (continua): " + str(e).split("\n")[0]
             st.markdown(reply)
@@ -663,7 +706,7 @@ if user := st.chat_input("Scrivi qui…"):
     with st.expander("🔎 NLP insight", expanded=False):
         st.write(nlp_data)
 
-    # >>> NUOVO: salviamo snapshot dell'ULTIMO input + predizione (PERSISTE tra i rerun)
+    # >>> Snapshot ULTIMO input + predizione (persiste tra i rerun)
     _pred = str(nlp_data.get("intent", "general") or "general")
     _score = float(nlp_data.get("score", 0.0) or 0.0)
     st.session_state["corr_snapshot"] = {
@@ -672,6 +715,25 @@ if user := st.chat_input("Scrivi qui…"):
         "predicted_score": _score,
     }
     st.caption("🖊️ Puoi correggere l'intent di questo messaggio nel pannello in fondo alla pagina.")
+
+    # >>> NUOVO: rileva cambio argomento e imposta il taglio del contesto
+    _prev_intent = st.session_state.get("last_intent", "general")
+    _new_intent  = _pred
+    _new_score   = _score
+    switch = (_new_intent != _prev_intent and _new_score >= INTENT_SWITCH_THR)
+    if switch:
+        # taglia il contesto PRIMA della generazione: da qui in avanti si riparte "pulito"
+        st.session_state["topic_cut_idx"] = len(st.session_state.history) - 1  # indice del messaggio utente appena aggiunto
+        st.info("🔀 Nuovo argomento rilevato: isolo il contesto precedente per questa risposta.")
+        write_nlp_log({
+            "event": "topic_switch",
+            "from": _prev_intent,
+            "to": _new_intent,
+            "score": _new_score,
+            "source": "streamlit_topic_fence"
+        })
+    # aggiorna l'ultimo intent visto
+    st.session_state["last_intent"] = _new_intent
 
     engine_now = st.session_state.get("engine", "openai")
     # Prompt arricchito (di default)
@@ -682,15 +744,24 @@ if user := st.chat_input("Scrivi qui…"):
 
     intent = nlp_data.get("intent", "general")
     system_text = system_prompt_for_intent(intent)
+    # >>> Istruzione globale: rispondi solo all'ultimo messaggio
+    system_text += " Rispondi riferendoti soltanto al messaggio più recente dell'utente; ignora il contesto precedente salvo riferimenti espliciti."
     if engine_now == "ollama":
-        system_text += " Mantieni rigorosamente la lingua italiana per tutta la risposta; non passare a inglese o spagnolo. Se accade, correggiti e torna subito all'italiano."
+        # PATCH A: regole più strette per lingua/stile (Ollama)
+        system_text += (
+            " Rispondi esclusivamente in italiano semplice e corretto. "
+            "Evita parole inventate, sigle casuali e MAIUSCOLE nel mezzo delle parole; non usare inglese. "
+            "Se non sei sicuro, rispondi in modo conciso senza riempitivi."
+        )
     didactic_suffix = (
         "\n\nStile didattico: organizza a sezioni con titoli brevi, definizioni chiare, esempi pratici e, in chiusura, 3 domande-quiz con relative risposte."
         if st.session_state.get("didactic", True) else ""
     )
 
-    # History corta + sanitizzazione
-    short_history = _short_history_by_chars(st.session_state.history[:-1], max_chars=9000)
+    # History corta + sanitizzazione → DALLA FENCE IN POI
+    _cut = int(st.session_state.get("topic_cut_idx", 0))
+    _history_for_ctx = st.session_state.history[_cut:-1]  # dalla fence fino PRIMA dell'input corrente
+    short_history = _short_history_by_chars(_history_for_ctx, max_chars=9000)
     short_history = [{"role": m["role"], "content": _sanitize_meta(m.get("content",""))} for m in short_history]
 
     base_messages = [{"role": "system", "content": system_text}] + short_history + [
@@ -746,6 +817,28 @@ if user := st.chat_input("Scrivi qui…"):
                         placeholder.markdown(reply)
                     else:
                         st.markdown(reply)
+
+            # PATCH C: repair-pass se output rumoroso (Ollama)
+            if engine_now == "ollama" and _looks_noisy(reply):
+                guard_sys = (
+                    "Sei un editor. Riscrivi il testo seguente in italiano chiaro e corretto "
+                    "in 5–8 frasi, eliminando parole inventate, sigle casuali e parti senza senso. "
+                    "Se qualcosa è scorretto o non verificabile, omettilo. Non usare inglese."
+                )
+                msgs_fix = [
+                    {"role": "system", "content": guard_sys},
+                    {"role": "user", "content": "TESTO DA RISCRIVERE:\n\n" + reply}
+                ]
+                try:
+                    fixed = call_chat_smart(msgs_fix, temperature=0.2)
+                    if fixed and len(fixed.strip()) > 120:
+                        reply = fixed.strip()
+                        if st.session_state.get("streaming_on", True):
+                            placeholder.markdown(reply)
+                        else:
+                            st.markdown(reply)
+                except Exception:
+                    pass
 
         except Exception as e:
             if not st.session_state.get("engine_lock", False):
