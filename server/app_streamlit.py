@@ -726,13 +726,18 @@ if st.session_state.get("do_continue"):
                     placeholder = st.empty()
                     pieces = []
                     stopped_by_sentinel = False
+                    # callback letta ad ogni chunk, così il click su STOP interrompe davvero la connessione
+                    _should_stop_cb = lambda: bool(st.session_state.get("stop_generation"))
+
                     for delta in stream_chat(
                             msgs,
                             model_override=st.session_state["ollama_model"],
                             temperature=0.7,
                             idle_timeout=8.0,
                             heartbeat_sec=2.0,
+                            should_stop=_should_stop_cb,  # ← AGGIUNTA
                     ):
+
                         if not isinstance(delta, str) or delta == "":
                             continue
                         pieces.append(delta)
@@ -796,12 +801,15 @@ if st.session_state.get("do_continue"):
                     placeholder = st.empty()
                     pieces = []
                     stopped_by_sentinel = False
+                    _should_stop_cb = lambda: bool(st.session_state.get("stop_generation"))
+
                     for delta in stream_chat(
                             msgs,
                             model_override=st.session_state["ollama_model"],
                             temperature=0.6,
                             idle_timeout=8.0,
                             heartbeat_sec=2.0,
+                            should_stop=_should_stop_cb,  # ← AGGIUNTA
                     ):
                         if not isinstance(delta, str) or delta == "":
                             continue
