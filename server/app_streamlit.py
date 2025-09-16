@@ -43,7 +43,7 @@ if not os.getenv("OLLAMA_MODEL"):
     os.environ["OLLAMA_MODEL"] = "gv/phi35-mini-gv:latest"
 
 import streamlit as st
-import requests  # Tenuto per compat, anche se non autodiscovery modelli
+import requests  # Tenuto per compat
 from PIL import Image
 
 # 2) Import moduli progetto
@@ -91,10 +91,20 @@ META_RX = re.compile(
     r"|\[[A-Z][A-Z0-9 _-]{2,}:[^\]]*\]"
     r"|\[[A-Z][A-Z0-9 _-]{2,}\])"
 )
+NLP_INSIGHT_RX = re.compile(r"(?im)^\s*🔎\s*NLP\s*insight\s*$")
+
 def _sanitize_meta(s: str) -> str:
     if not s:
         return s
     return META_RX.sub("", s).strip()
+
+# ▶︎ PATCH 3: estensione sanitizer per rimuovere anche rumore tipo “🔎 NLP insight”
+def _sanitize_meta_and_noise(s: str) -> str:
+    if not s:
+        return s
+    s = META_RX.sub("", s)
+    s = NLP_INSIGHT_RX.sub("", s)
+    return s.strip()
 
 DRIFT_PREFIX_RX = re.compile(r"(?is)^\s*(instruction[s]?:.*?\n+|\s*i['’]m\s+sorry[^.\n]*[.\n]+\s*)")
 def _strip_drift_prefix(text: str) -> str:
@@ -108,6 +118,9 @@ def _strip_drift_lines(text: str) -> str:
     if not text:
         return text
     return DRIFT_LINES_RX.sub("", text)
+
+# ▶︎ PATCH 1: Sentinel di chiusura (coerente con Modelfile)
+OLLAMA_SENTINEL = "[[END_OF_OUTPUT]]"
 
 # ==== Export helpers ==========================================================
 def export_chat_md(history: list) -> str:
@@ -156,8 +169,7 @@ def _is_reduant(chunk: str, acc: str) -> bool:
 def _too_similar(a: str, b: str, threshold: float = 0.86) -> bool:
     if not a or not b:
         return False
-    import difflib as _dl
-    ratio = _dl.SequenceMatcher(None, a.strip().lower(), b.strip().lower()).ratio()
+    ratio = difflib.SequenceMatcher(None, a.strip().lower(), b.strip().lower()).ratio()
     return ratio >= threshold
 
 def _find_last_user_and_assistant(history: list) -> tuple[str, str]:
@@ -197,7 +209,7 @@ def post_format_response(text: str) -> str:
     - rimuove link placeholder [titolo]()
     - normalizza heading profondi a '## '
     - bullet coerenti ('- ')
-    - sopprime boilerplate inglese comune in righe isolate
+    - sopprime boilerplate inglese in righe isolate
     - normalizza spazi finali e ritorni multipli
     """
     if not text:
@@ -228,7 +240,6 @@ def post_format_response(text: str) -> str:
 
 # === THEME (nautico chiaro) & GLOBAL CSS ====================================
 def _nautical_css(pro_mode: bool = False) -> str:
-    # Versione più compatta: font più piccoli, line-height più bassa, padding ridotto
     if pro_mode:
         return """
         <style>
@@ -446,7 +457,7 @@ st.session_state.setdefault("ollama_model", os.getenv("OLLAMA_MODEL") or "gv/phi
 st.session_state.setdefault("ollama_base", os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434")
 st.session_state.setdefault("engine_lock", (os.getenv("GV_ENGINE_LOCK", "0").lower() in ("1","true","yes","on")))
 st.session_state.setdefault("outline", "")
-st.session_state.setdefault("didactic", False)  # default OFF
+st.session_state.setdefault("didactic", False)
 st.session_state.setdefault("thinking", False)
 st.session_state.setdefault("target_words", 800)
 st.session_state.setdefault("max_rounds", 4)
@@ -454,6 +465,7 @@ st.session_state.setdefault("streaming_on", True)
 st.session_state.setdefault("stop_generation", False)
 st.session_state.setdefault("high_readability", True)
 st.session_state.setdefault("logo_bytes", None)
+st.session_state.setdefault("history", load_memory())  # <- init sicuro
 
 with st.sidebar:
     st.header("⚙️ Aspetto")
@@ -604,10 +616,7 @@ with st.sidebar:
 
 _warn_keys()
 
-# 6) Stato conversazione
-if "history" not in st.session_state:
-    st.session_state.history = load_memory()
-
+# 6) Stato conversazione (già inizializzato con setdefault sopra)
 # 7) Mostra conversazione
 for msg in st.session_state.history:
     with st.chat_message(msg["role"]):
@@ -639,8 +648,8 @@ if st.session_state.get("do_continue"):
     if engine_now == "ollama":
         system_text += " Mantieni rigorosamente la lingua italiana per tutta la risposta; non passare a inglese o spagnolo. Se accade, correggiti e torna subito all'italiano."
 
-    san_last_user = _sanitize_meta(last_user_text)
-    san_last_assistant = _sanitize_meta(last_assistant_text)
+    san_last_user = _sanitize_meta_and_noise(last_user_text)
+    san_last_assistant = _sanitize_meta_and_noise(last_assistant_text)
 
     with st.chat_message("assistant"):
         t0 = time.time()
@@ -673,7 +682,7 @@ if st.session_state.get("do_continue"):
 # 8) Input utente (turno normale)
 user = st.chat_input("Scrivi qui…")
 if user:
-    san_user = _sanitize_meta(user)
+    san_user = _sanitize_meta_and_noise(user)
 
     st.session_state.history.append({"role": "user", "content": san_user})
     log.info(f"USER: {san_user}")
@@ -697,7 +706,7 @@ if user:
             if st.session_state.get("didactic", False) else ""
         )
         short_history = _short_history_by_chars(st.session_state.history[:-1], max_chars=9000)
-        short_history = [{"role": m["role"], "content": _sanitize_meta(m.get("content",""))} for m in short_history]
+        short_history = [{"role": m["role"], "content": _sanitize_meta_and_noise(m.get("content",""))} for m in short_history]
         base_messages = [{"role": "system", "content": system_text}] + short_history + [
             {"role": "user", "content": compose_prompt(san_user, nlp_data) + didactic_suffix}
         ]
@@ -711,10 +720,13 @@ if user:
 
         try:
             if st.session_state.get("streaming_on", True):
+                # ▶︎ PATCH 2: streaming “light formatting” + sentinel stop
                 placeholder = st.empty()
                 pieces = []
                 def _should_stop_cb() -> bool:
                     return bool(st.session_state.get("stop_generation"))
+
+                stopped_by_sentinel = False
                 for delta in stream_chat(
                     base_messages,
                     model_override=(
@@ -726,20 +738,38 @@ if user:
                     idle_timeout=8.0,
                     heartbeat_sec=2.0,
                 ):
-                    if not isinstance(delta, str) or not delta.strip():
+                    if not isinstance(delta, str):
                         continue
-                    # ⬇️ join naturale, senza inserire spazi artificiali
-                    pieces.append(delta)
-                    text = "".join(pieces)
-                    text = _strip_drift_lines(_strip_drift_prefix(text))
-                    placeholder.markdown(text)
+                    if delta == "":
+                        continue
 
-                reply = "".join(pieces).strip()
+                    pieces.append(delta)
+                    joined = "".join(pieces)
+
+                    # Stop immediato su sentinel
+                    if OLLAMA_SENTINEL in joined:
+                        joined = joined.split(OLLAMA_SENTINEL, 1)[0]
+                        stopped_by_sentinel = True
+
+                    # Solo normalizzazione minima durante lo stream
+                    light = re.sub(r"(?m)^\s*#{4,}\s*", "## ", joined)
+                    placeholder.markdown(light)
+
+                    if stopped_by_sentinel:
+                        break
+
+                reply = "".join(pieces)
+                if OLLAMA_SENTINEL in reply:
+                    reply = reply.split(OLLAMA_SENTINEL, 1)[0]
+                reply = reply.strip()
                 if not reply:
                     raise RuntimeError("Nessun testo dallo stream")
 
-                # Post-format finale e refresh placeholder
+                # Post-processing completo **a fine stream**
                 reply = _strip_drift_lines(_strip_drift_prefix(reply))
+                reply = re.sub(r"(?im)^\s*🔎\s*NLP\s*insight\s*$", "", reply)
+                reply = re.sub(r"\s+([.,;:!?])", r"\1", reply)
+                reply = re.sub(r"[ \t]{2,}", " ", reply)
                 reply = post_format_response(reply)
                 placeholder.markdown(reply)
 
@@ -813,4 +843,11 @@ except Exception:
 
 corr_sel = st.selectbox("Seleziona l'intent corretto", labels, index=default_idx, key="corr_global_select")
 if st.button("💾 Salva correzione intent"):
-    st.success(f"Intent aggiornato in sessione: {corr_sel}")
+    if corr_snapshot["text"]:
+        k = _intent_key(corr_snapshot["text"])
+        st.session_state["intent_overrides"][k] = corr_sel
+        st.success(f"Intent aggiornato per quel messaggio: {corr_sel}")
+        st.rerun()  # refresh immediato dell'NLP insight
+    else:
+        st.warning("Nessun messaggio utente da correggere.")
+
