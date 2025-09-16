@@ -3,40 +3,21 @@
 # GV_GPT — L’aria sta cambiando (Streamlit, tema nautico chiaro)
 # - Engine switch: OpenAI ↔ HuggingFace ↔ Ollama
 # - 🔒 Engine Lock + Fallback smart (se lock OFF): OpenAI → HuggingFace → Ollama
-# - Didattica + Thinking longform "continue-only" con outline+tail (Ollama)
+# - Didattica opzionale (solo OpenAI/HF)
 # - Streaming: OpenAI/Ollama; HuggingFace pseudo-stream (tutto in un colpo)
 # - Memoria persistente, export, diagnostica, slider num_predict e temperatura per Ollama
 # - Toggle “Alta leggibilità” per passare da scenografico a pro
 # - Sanitizer anti meta-marker + filtri anti drift (“Instruction/Your task/Begin by”)
-# - Topic fence: isola il contesto quando cambia argomento
+# - Pannello “🖊️ Correzione intent”
 # ─────────────────────────────────────────────────────────────────────────────
 
 # 0) Ponte: assicura che la root del progetto sia nel PYTHONPATH
-import sys
-from pathlib import Path
-
-def find_project_root(start: Path | None = None) -> Path:
-    start = start or Path(__file__).resolve()
-    cur = start if start.is_dir() else start.parent
-    for _ in range(7):
-        if (cur / "data").exists() and (cur / "nlp_layer").exists():
-            return cur
-        cur = cur.parent
-    return Path(__file__).resolve().parent  # fallback
-
-ROOT = find_project_root()
+import sys, pathlib
+ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 # 1) Env & imports base
-try:
-    from dotenv import load_dotenv
-except Exception:
-    load_dotenv = None
-
-if load_dotenv:
-    load_dotenv(ROOT / ".env")
-
 import os
 import json
 import time
@@ -44,6 +25,9 @@ import re
 import difflib
 from datetime import datetime
 from io import BytesIO
+
+from dotenv import load_dotenv
+load_dotenv(ROOT / ".env")
 
 # --- Boot Guard (anti-mix progetti) ------------------------------------------
 try:
@@ -54,12 +38,12 @@ except Exception:
     if PID and PID != EXPECTED:
         raise SystemExit(f"[ABORT] Wrong PROJECT_ID. Expected {EXPECTED}, got {PID!r}.")
 
-# Default Ollama model se non in .env
+# Default Ollama model se non in .env (ADEGUATO al Modelfile creato)
 if not os.getenv("OLLAMA_MODEL"):
-    os.environ["OLLAMA_MODEL"] = "phi3:3.8b"
+    os.environ["OLLAMA_MODEL"] = "gv/phi35-mini-gv:latest"
 
 import streamlit as st
-import requests  # per autodiscovery modelli Ollama
+import requests  # Tenuto per compat, anche se non autodiscovery modelli
 from PIL import Image
 
 # 2) Import moduli progetto
@@ -75,6 +59,7 @@ try:
 except Exception:
     def analyze_text(txt: str):
         return {"intent": "general", "entities": [], "lang": "it"}
+
 try:
     from orchestrator.orchestrator import compose_prompt, system_prompt_for_intent
 except Exception:
@@ -99,47 +84,7 @@ except Exception:
 
 log = get_logger()
 
-# --- (NUOVO) Percorsi log supervisioni + writer robusto ----------------------
-from datetime import datetime as _dt_for_log  # alias per non confliggere
-import hashlib as _hashlib_for_log
-
-DATA = ROOT / "data"
-LOG_FILE = DATA / "nlp_logs.jsonl"
-
-_last_sig = None
-_last_sig_at = 0.0
-
-def write_nlp_log(payload: dict):
-    """
-    Scrive su data/nlp_logs.jsonl e ritorna (ok: bool, err: str|None).
-    - timestamp coerenti: 'ts' epoch + 'time' ISO8601
-    - anti-duplicato entro 2s (mitiga i rerun Streamlit)
-    """
-    try:
-        DATA.mkdir(parents=True, exist_ok=True)
-        safe = dict(payload or {})
-        ts = time.time()
-        safe.setdefault("ts", ts)
-        safe["time"] = _dt_for_log.fromtimestamp(ts).isoformat()
-        line = json.dumps(safe, ensure_ascii=False, separators=(",", ":")) + "\n"
-
-        global _last_sig, _last_sig_at
-        sig = _hashlib_for_log.sha1(line.encode("utf-8")).hexdigest()
-        if _last_sig == sig and (ts - _last_sig_at) < 2.0:
-            return True, None  # duplicato evitato → ok
-
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(line)
-            f.flush()
-            os.fsync(f.fileno())
-
-        _last_sig, _last_sig_at = sig, ts
-        return True, None
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
-
 # --- Sanitizer / Post-processor anti drift -----------------------------------
-# 1) Rimuove token stile LLM (<|...|>) e direttive tra [] (INTENT, ecc.)
 META_RX = re.compile(
     r"(?is)(<\|[^>]*\|>"
     r"|\[(?:INTENT|EXPLICIT[\s_-]*ACTION[\s_-]*LIST)[^\]]*\]"
@@ -151,7 +96,6 @@ def _sanitize_meta(s: str) -> str:
         return s
     return META_RX.sub("", s).strip()
 
-# 2) Rimuove prefissi tipo "Instruction …" / "I'm sorry …"
 DRIFT_PREFIX_RX = re.compile(r"(?is)^\s*(instruction[s]?:.*?\n+|\s*i['’]m\s+sorry[^.\n]*[.\n]+\s*)")
 def _strip_drift_prefix(text: str) -> str:
     if not text:
@@ -159,24 +103,11 @@ def _strip_drift_prefix(text: str) -> str:
     out = DRIFT_PREFIX_RX.sub("", text).lstrip()
     return out if out else text
 
-# 3) Sopprime righe “Your task … / Instruction … / Begin by …”
 DRIFT_LINES_RX = re.compile(r"(?im)^\s*(your\s+task|instruction|begin\s+by)\s*:\s.*$")
 def _strip_drift_lines(text: str) -> str:
     if not text:
         return text
     return DRIFT_LINES_RX.sub("", text)
-
-# --- PATCH B: Rilevatore di “rumore” in output (maiuscole in mezzo, caps lunghi, parole mostro)
-NOISE_UPPER_RX   = re.compile(r"[a-zà-öø-ÿ]{2,}[A-Z]{2,}[a-zà-öø-ÿ]{2,}")
-LONG_ALLCAPS_RX  = re.compile(r"\b[A-Z]{10,}\b")
-VERYLONG_RX      = re.compile(r"\b[\wÀ-ÿ]{28,}\b")
-def _looks_noisy(text: str) -> bool:
-    if not text or len(text) < 120:
-        return False
-    bad = (len(NOISE_UPPER_RX.findall(text))
-           + len(LONG_ALLCAPS_RX.findall(text))
-           + len(VERYLONG_RX.findall(text)))
-    return bad >= 3
 
 # ==== Export helpers ==========================================================
 def export_chat_md(history: list) -> str:
@@ -225,7 +156,8 @@ def _is_reduant(chunk: str, acc: str) -> bool:
 def _too_similar(a: str, b: str, threshold: float = 0.86) -> bool:
     if not a or not b:
         return False
-    ratio = difflib.SequenceMatcher(None, a.strip().lower(), b.strip().lower()).ratio()
+    import difflib as _dl
+    ratio = _dl.SequenceMatcher(None, a.strip().lower(), b.strip().lower()).ratio()
     return ratio >= threshold
 
 def _find_last_user_and_assistant(history: list) -> tuple[str, str]:
@@ -276,28 +208,47 @@ def _nautical_css(pro_mode: bool = False) -> str:
             --input-bg: #ffffff;
             --placeholder: #50627a;
           }
-          [data-testid="stAppViewContainer"]{ background: linear-gradient(180deg, var(--bg-top) 0%, var(--bg-bottom) 100%); }
+          [data-testid="stAppViewContainer"]{
+            background: linear-gradient(180deg, var(--bg-top) 0%, var(--bg-bottom) 100%);
+          }
           [data-testid="stAppViewContainer"] .main .block-container{
-            background: var(--card); border: 1px solid var(--border); border-radius: 18px;
-            box-shadow: 0 6px 26px rgba(15, 23, 42, .04); padding: 1rem 1.25rem 1.5rem 1.25rem;
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 18px;
+            box-shadow: 0 6px 26px rgba(15, 23, 42, .04);
+            padding: 1rem 1.25rem 1.5rem 1.25rem;
           }
           .main .block-container, .main .block-container p, .main .block-container li, 
           .main .block-container label, .main .block-container h1, .main .block-container h2, .main .block-container h3{
-            color: var(--fg); font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+            color: var(--fg);
+            font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
           }
-          .brand-title{ font-family: 'Plus Jakarta Sans', Inter, system-ui; font-weight: 700; letter-spacing: .2px;
-            font-size: clamp(24px, 3.6vw, 36px); color: var(--fg); }
+          .brand-title{
+            font-family: 'Plus Jakarta Sans', Inter, system-ui;
+            font-weight: 700; letter-spacing: .2px;
+            font-size: clamp(24px, 3.6vw, 36px);
+            color: var(--fg);
+          }
           .brand-sub{ color: var(--fg-muted); font-size: 14px; margin-top: .25rem; }
-          .hero-card{ border-radius: 16px; padding: 14px 18px; border: 1px solid var(--border); background: #fffffff6; }
-          .side-card{ border-radius: 16px; padding: 12px; border: 1px solid var(--border); background: #ffffff;
-            display:flex;align-items:center;justify-content:center; aspect-ratio: 1.8/1; }
-          [data-testid="stChatMessage"] > div:first-child{ border-radius: 12px !important; border: 1px solid var(--border); background: var(--bubble); }
+          .hero-card{
+            border-radius: 16px; padding: 14px 18px; border: 1px solid var(--border);
+            background: #fffffff6;
+          }
+          .side-card{
+            border-radius: 16px; padding: 12px; border: 1px solid var(--border); background: #ffffff;
+            display:flex;align-items:center;justify-content:center; aspect-ratio: 1.8/1;
+          }
+          [data-testid="stChatMessage"] > div:first-child{
+            border-radius: 12px !important; border: 1px solid var(--border); background: var(--bubble);
+          }
           [data-testid="stChatInput"] textarea{
             background: var(--input-bg) !important; border: 1px solid var(--border) !important;
             color: var(--fg) !important; caret-color: var(--accent) !important;
           }
           [data-testid="stChatInput"] textarea::placeholder{ color: var(--placeholder) !important; opacity: 1 !important; }
-          .stTextInput input, .stTextArea textarea{ background: var(--input-bg) !important; border: 1px solid var(--border) !important; color: var(--fg) !important; }
+          .stTextInput input, .stTextArea textarea{
+            background: var(--input-bg) !important; border: 1px solid var(--border) !important; color: var(--fg) !important;
+          }
           .stTextInput input::placeholder, .stTextArea textarea::placeholder{ color: var(--placeholder) !important; opacity: 1 !important; }
           .main .block-container a{ color: var(--link); text-decoration: none; }
           .wave-wrap{height: 30px; overflow: hidden; margin-top: 6px;}
@@ -312,27 +263,46 @@ def _nautical_css(pro_mode: bool = False) -> str:
             --bg-top: #f7fbff; --bg-bottom: #edf6ff; --fg: #0f172a; --fg-muted: #334155; --border: #dbeafe;
             --card: #ffffffee; --bubble: #f8fbff; --link: #0ea5e9; --accent: #2563eb; --input-bg: #ffffff; --placeholder: #64748b;
           }
-          [data-testid="stAppViewContainer"]{ background: linear-gradient(180deg, var(--bg-top) 0%, var(--bg-bottom) 100%); }
+          [data-testid="stAppViewContainer"]{
+            background: linear-gradient(180deg, var(--bg-top) 0%, var(--bg-bottom) 100%);
+          }
           [data-testid="stAppViewContainer"] .main .block-container{
-            background: var(--card); border: 1px solid var(--border); border-radius: 18px; box-shadow: 0 8px 24px rgba(2,6,23,.06);
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 18px;
+            box-shadow: 0 8px 24px rgba(2,6,23,.06);
             padding: 1rem 1.25rem 1.5rem 1.25rem;
           }
           .main .block-container, .main .block-container p, .main .block-container li, 
           .main .block-container label, .main .block-container h1, .main .block-container h2, .main .block-container h3{
-            color: var(--fg); font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+            color: var(--fg);
+            font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
           }
-          .brand-title{ font-family: 'Plus Jakarta Sans', Inter, system-ui; font-weight: 700; letter-spacing: .2px;
-            font-size: clamp(26px, 4vw, 40px); color: var(--fg); }
+          .brand-title{
+            font-family: 'Plus Jakarta Sans', Inter, system-ui;
+            font-weight: 700; letter-spacing: .2px;
+            font-size: clamp(26px, 4vw, 40px);
+            color: var(--fg);
+          }
           .brand-sub{ color: var(--fg-muted); font-size: 14px; margin-top: .25rem; }
-          .hero-card{ border-radius: 16px; padding: 14px 18px; border: 1px solid var(--border); background: #fffffff6; box-shadow: 0 8px 24px rgba(2,6,23,.06); }
-          .side-card{ border-radius: 16px; padding: 12px; border: 1px solid var(--border); background: #ffffffbf;
-            display:flex;align-items:center;justify-content:center; aspect-ratio: 1.8/1; }
-          [data-testid="stChatMessage"] > div:first-child{ border-radius: 12px !important; border: 1px solid var(--border); background: var(--bubble); }
+          .hero-card{
+            border-radius: 16px; padding: 14px 18px; border: 1px solid var(--border);
+            background: #fffffff6; box-shadow: 0 8px 24px rgba(2,6,23,.06);
+          }
+          .side-card{
+            border-radius: 16px; padding: 12px; border: 1px solid var(--border); background: #ffffffbf;
+            display:flex;align-items:center;justify-content:center; aspect-ratio: 1.8/1;
+          }
+          [data-testid="stChatMessage"] > div:first-child{
+            border-radius: 12px !important; border: 1px solid var(--border); background: var(--bubble);
+          }
           [data-testid="stChatInput"] textarea{
             background: var(--input-bg) !important; border: 1px solid var(--border) !important; color: var(--fg) !important; caret-color: var(--accent) !important;
           }
           [data-testid="stChatInput"] textarea::placeholder{ color: var(--placeholder) !important; opacity: 1 !important; }
-          .stTextInput input, .stTextArea textarea{ background: var(--input-bg) !important; border: 1px solid var(--border) !important; color: var(--fg) !important; }
+          .stTextInput input, .stTextArea textarea{
+            background: var(--input-bg) !important; border: 1px solid var(--border) !important; color: var(--fg) !important;
+          }
           .stTextInput input::placeholder, .stTextArea textarea::placeholder{ color: var(--placeholder) !important; opacity: 1 !important; }
           .main .block-container a{ color: var(--link); text-decoration: none; }
           .wave-wrap{height: 36px; overflow: hidden; margin-top: 6px;}
@@ -371,21 +341,6 @@ def _wave_svg(width="100%", height=36):
     </svg>
     """
 
-# ── NEW: bussola animata durante l'elaborazione ──────────────────────────────
-def _compass_spinner(msg: str = "Sto pensando..."):
-    return f"""
-    <div style="display:flex;align-items:center;gap:10px;padding:6px 4px;">
-      <svg width="28" height="28" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-        <circle cx="50" cy="50" r="45" fill="none" stroke="#93c5fd" stroke-width="6" opacity=".6"/>
-        <polygon points="50,20 44,52 50,58 56,52" fill="#1e40af">
-          <animateTransform attributeName="transform" type="rotate" from="0 50 50" to="360 50 50" dur="1.6s" repeatCount="indefinite"/>
-        </polygon>
-        <circle cx="50" cy="50" r="4" fill="#1e3a8a"/>
-      </svg>
-      <span style="font:600 14px/1.2 'Inter',system-ui;color:#0f172a;">{msg}</span>
-    </div>
-    """
-
 def render_hero(high_readability: bool = False, logo_bytes: bytes | None = None) -> None:
     st.markdown(_nautical_css(high_readability), unsafe_allow_html=True)
     c1, c2 = st.columns([1.2, 2.6])
@@ -394,8 +349,7 @@ def render_hero(high_readability: bool = False, logo_bytes: bytes | None = None)
         if logo_bytes:
             try:
                 im = Image.open(BytesIO(logo_bytes))
-                # DEPRECATION FIX: use_container_width
-                st.image(im, use_container_width=True)
+                st.image(im, use_column_width=True)
             except Exception:
                 st.markdown(_sailboat_svg(240), unsafe_allow_html=True)
         else:
@@ -423,30 +377,23 @@ def _warn_keys():
 # 4) UI base
 st.set_page_config(page_title="GV_GPT — L’aria sta cambiando", page_icon="⛵", layout="wide")
 
-# --- Topic fence: soglia per riconoscere un cambio argomento dagli intent ---
-INTENT_SWITCH_THR = float(os.getenv("INTENT_SWITCH_THR", "0.5"))
-
 # 5) Stato app e sidebar
 st.session_state.setdefault("persist", True)
 st.session_state.setdefault("engine", (os.getenv("GV_ENGINE", "openai") or "openai").lower())
 st.session_state.setdefault("openai_model", os.getenv("OPENAI_MODEL") or "gpt-4o-mini")
 st.session_state.setdefault("hf_model", os.getenv("HUGGINGFACE_MODEL") or "meta-llama/Meta-Llama-3.1-8B-Instruct")
-st.session_state.setdefault("ollama_model", os.getenv("OLLAMA_MODEL") or "phi3:3.8b")
+st.session_state.setdefault("ollama_model", os.getenv("OLLAMA_MODEL") or "gv/phi35-mini-gv:latest")
 st.session_state.setdefault("ollama_base", os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434")
 st.session_state.setdefault("engine_lock", (os.getenv("GV_ENGINE_LOCK", "0").lower() in ("1","true","yes","on")))
 st.session_state.setdefault("outline", "")
-st.session_state.setdefault("didactic", True)
+st.session_state.setdefault("didactic", False)  # default OFF
 st.session_state.setdefault("thinking", False)
 st.session_state.setdefault("target_words", 800)
 st.session_state.setdefault("max_rounds", 4)
 st.session_state.setdefault("streaming_on", True)
+st.session_state.setdefault("stop_generation", False)
 st.session_state.setdefault("high_readability", True)
 st.session_state.setdefault("logo_bytes", None)
-st.session_state.setdefault("corr_snapshot", None)  # snapshot ultimo input+pred
-st.session_state.setdefault("topic_cut_idx", 0)     # indice da cui considerare il contesto
-st.session_state.setdefault("last_intent", "general")  # ultimo intent visto
-# NEW: stop forzato (UI)
-st.session_state.setdefault("stop_generation", False)
 
 with st.sidebar:
     st.header("⚙️ Aspetto")
@@ -474,7 +421,7 @@ with st.sidebar:
 
     # OpenAI
     st.subheader("OpenAI")
-    openai_suggestions = ["gpt-4o-mini", "gpt-4o", "o4-mini", "gpt-4.1-mini", "Custom…"]
+    openai_suggestions = ["gpt-4o-mini", "o4-mini", "gpt-4o", "Custom…"]
     current_openai = st.session_state["openai_model"]
     if current_openai not in openai_suggestions:
         openai_suggestions.insert(-1, current_openai)
@@ -496,31 +443,17 @@ with st.sidebar:
         help="Esempi: meta-llama/Meta-Llama-3.1-8B-Instruct, mistralai/Mixtral-8x7B-Instruct-v0.1, google/gemma-2-9b-it"
     )
 
-    # Ollama
+    # Ollama (whitelist curata)
     st.subheader("Ollama (locale)")
     base_val = st.text_input("Base URL", value=st.session_state["ollama_base"], help="Di solito http://localhost:11434")
-    def _discover_ollama_models(base_url: str) -> list[str]:
-        base = (base_url or "http://localhost:11434").rstrip("/")
-        try:
-            r = requests.get(f"{base}/api/tags", timeout=3)
-            r.raise_for_status()
-            data = r.json() or {}
-            models = [m.get("name") for m in data.get("models", []) if isinstance(m.get("name"), str)]
-            pref = ["phi3:3.8b", "llama3:8b", "mistral:7b"]
-            ordered = [m for m in pref if m in models] + [m for m in models if m not in pref]
-            return ordered or ["phi3:3.8b", "llama3:8b", "mistral:7b"]
-        except Exception:
-            return ["phi3:3.8b", "llama3:8b", "mistral:7b"]
-    models_local = _discover_ollama_models(base_val)
-    models_local = models_local + ["Custom…"]
+    os.environ["OLLAMA_BASE_URL"] = base_val.strip()
+    OLLAMA_WHITELIST = ["gv/phi35-mini-gv:latest"]
     current_ollama = st.session_state["ollama_model"]
-    if current_ollama not in models_local:
-        models_local.insert(0, current_ollama)
-    ollama_sel = st.selectbox("Modello Ollama", options=models_local, index=models_local.index(current_ollama))
-    if ollama_sel == "Custom…":
-        current_ollama = st.text_input("Modello Ollama (custom)", value=st.session_state["ollama_model"])
-    else:
-        current_ollama = ollama_sel
+    if current_ollama not in OLLAMA_WHITELIST:
+        current_ollama = OLLAMA_WHITELIST[0]
+    ollama_sel = st.selectbox("Modello Ollama", options=OLLAMA_WHITELIST, index=OLLAMA_WHITELIST.index(current_ollama))
+    current_ollama = ollama_sel
+    st.session_state["ollama_model"] = current_ollama
 
     st.header("📝 Output (Ollama)")
     default_tok = int(os.getenv("OLLAMA_NUM_PREDICT", "900") or "900")
@@ -536,7 +469,7 @@ with st.sidebar:
         st.session_state["engine"] = "openai" if engine_choice == "OpenAI" else ("hugging" if engine_choice == "HuggingFace" else "ollama")
         st.session_state["openai_model"] = (current_openai or "gpt-4o-mini").strip()
         st.session_state["hf_model"] = (current_hf or "meta-llama/Meta-Llama-3.1-8B-Instruct").strip()
-        st.session_state["ollama_model"] = (current_ollama or "phi3:3.8b").strip()
+        st.session_state["ollama_model"] = (current_ollama or "gv/phi35-mini-gv:latest").strip()
         st.session_state["ollama_base"]  = (base_val or "http://localhost:11434").strip()
 
         os.environ["GV_ENGINE"]        = st.session_state["engine"]
@@ -553,40 +486,31 @@ with st.sidebar:
     st.session_state["engine_lock"] = lock
     os.environ["GV_ENGINE_LOCK"] = "1" if lock else "0"
 
-    st.header("🧠 Memoria")
-    st.checkbox("Mantieni chat tra riavvii", key="persist")
-    cols_mem = st.columns(2)
-    with cols_mem[0]:
-        if st.button("🧹 Svuota chat"):
-            st.session_state.history = []
-            st.success("Chat svuotata.")
-    with cols_mem[1]:
-        if st.button("🗑️ Cancella memoria salvata"):
-            clear_memory()
-            st.success("Memoria persistente cancellata.")
+    st.header("🧠 Outline (auto)")
+    st.caption("Aggiornamento periodico dell’outline dalla bozza corrente (esperimentale).")
 
     st.header("🎓 Modalità didattica")
     st.session_state["didactic"] = st.checkbox("Spiega passo-passo (sezioni, esempi, mini-quiz)", value=st.session_state["didactic"])
 
-    st.header("🧠 Thinking (longform)")
-    st.session_state["thinking"] = st.checkbox("Attiva modalità lunga (continue-only su Ollama)", value=st.session_state["thinking"])
-    target_label = st.select_slider(
-        "Lunghezza desiderata",
-        options=["~400 parole", "~800 parole", "~1200 parole", "~2000 parole"],
-        value="~800 parole" if st.session_state["target_words"] == 800 else
-              "~400 parole" if st.session_state["target_words"] == 400 else
-              "~1200 parole" if st.session_state["target_words"] == 1200 else "~2000 parole"
-    )
-    target_words_map = {"~400 parole": 400, "~800 parole": 800, "~1200 parole": 1200, "~2000 parole": 2000}
-    st.session_state["target_words"] = target_words_map[target_label]
-    st.session_state["max_rounds"] = st.slider("Max round extra", 0, 8, st.session_state["max_rounds"])
-
     st.header("⚡ Streaming")
     st.session_state["streaming_on"] = st.checkbox("Streaming live (dove supportato)", value=st.session_state["streaming_on"])
-    # NEW: stop forzato
     if st.button("🛑 Stop generazione (forza stop)"):
         st.session_state["stop_generation"] = True
         st.toast("Interruzione richiesta", icon="🛑")
+
+    # ⬇️⬇️⬇️ BLOCCO RIPRISTINATO: MEMORIA
+    st.header("💾 Memoria")
+    st.session_state["persist"] = st.checkbox("Mantieni chat tra riavvii", value=st.session_state["persist"])
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("🧹 Svuota chat"):
+            st.session_state.history = []
+            st.success("Chat svuotata.")
+    with c2:
+        if st.button("🗑️ Cancella memoria salvata"):
+            clear_memory()
+            st.success("Memoria persistente cancellata.")
+    # ⬆️⬆️⬆️ FINE BLOCCO MEMORIA
 
     st.header("▶ Continua")
     has_chat_state = bool(st.session_state.get("history"))
@@ -632,8 +556,6 @@ for msg in st.session_state.history:
 
 # ---------- OUTLINE MANAGEMENT -----------------------------------------------
 def _update_outline_if_needed(full_text: str, every_round: int, round_idx: int, system_text: str):
-    if every_round <= 0 or round_idx % every_round != 0:
-        return
     ask = (
         "Sintetizza in 10-12 bullet point l'outline dei contenuti già scritti qui sotto."
         " Niente frasi lunghe, niente introduzioni, niente conclusioni, niente ripetizioni."
@@ -656,23 +578,14 @@ if st.session_state.get("do_continue"):
     engine_now = st.session_state.get("engine", "openai")
     system_text = system_prompt_for_intent("general")
     if engine_now == "ollama":
-        # PATCH A: regole più strette per lingua/stile (Ollama)
-        system_text += (
-            " Rispondi esclusivamente in italiano semplice e corretto. "
-            "Evita parole inventate, sigle casuali e MAIUSCOLE nel mezzo delle parole; non usare inglese. "
-            "Se non sei sicuro, rispondi in modo conciso senza riempitivi."
-        )
+        system_text += " Mantieni rigorosamente la lingua italiana per tutta la risposta; non passare a inglese o spagnolo. Se accade, correggiti e torna subito all'italiano."
 
-    # Sanitize degli ultimi turni
     san_last_user = _sanitize_meta(last_user_text)
     san_last_assistant = _sanitize_meta(last_assistant_text)
 
     with st.chat_message("assistant"):
         t0 = time.time()
         reply = ""
-        # Spinner visivo finché non arriva output
-        spin = st.empty()
-        spin.markdown(_compass_spinner("Sto generando la continuazione…"), unsafe_allow_html=True)
         try:
             msgs = build_continue_only_messages(
                 system_once=system_text,
@@ -683,35 +596,12 @@ if st.session_state.get("do_continue"):
                 didactic=False,
             )
             chunk = call_chat_smart(msgs, temperature=0.7)  # non-stream per applicare guardie
-            spin.empty()
-            # Anti-drift/apology/Instruction
             chunk = _strip_drift_lines(_strip_drift_prefix(chunk))
             if _looks_restart(chunk) or _is_reduant(chunk, san_last_assistant) or _too_similar(chunk, san_last_assistant):
                 chunk = re.sub(r'(?is)^.{0,300}\n', '', chunk, count=1).strip()
             reply = (chunk or "").replace("<<FINE>>","").strip()
             st.markdown(reply if reply else "_(nessun avanzamento)_")
-
-            # PATCH C: repair-pass se output rumoroso (Ollama)
-            if engine_now == "ollama" and _looks_noisy(reply):
-                guard_sys = (
-                    "Sei un editor. Riscrivi il testo seguente in italiano chiaro e corretto "
-                    "in 5–8 frasi, eliminando parole inventate, sigle casuali e parti senza senso. "
-                    "Se qualcosa è scorretto o non verificabile, omettilo. Non usare inglese."
-                )
-                msgs_fix = [
-                    {"role": "system", "content": guard_sys},
-                    {"role": "user", "content": "TESTO DA RISCRIVERE:\n\n" + reply}
-                ]
-                try:
-                    fixed = call_chat_smart(msgs_fix, temperature=0.2)
-                    if fixed and len(fixed.strip()) > 120:
-                        reply = fixed.strip()
-                        st.markdown(reply)
-                except Exception:
-                    pass
-
         except Exception as e:
-            spin.empty()
             reply = "⚠️ Errore (continua): " + str(e).split("\n")[0]
             st.markdown(reply)
         log.info(f"CONTINUE elapsed={time.time()-t0:.1f}s")
@@ -721,250 +611,139 @@ if st.session_state.get("do_continue"):
         save_memory(st.session_state.history)
 
 # 8) Input utente (turno normale)
-if user := st.chat_input("Scrivi qui…"):
-    # Sanitizza subito l'input per evitare drift
+user = st.chat_input("Scrivi qui…")
+if user:
     san_user = _sanitize_meta(user)
 
     st.session_state.history.append({"role": "user", "content": san_user})
     log.info(f"USER: {san_user}")
 
-    # Echo immediato in chat per evitare effetto “sparizione”
     with st.chat_message("user"):
         st.markdown(san_user)
 
-    # NLP + orchestrator
     nlp_data = analyze_text(san_user)
     with st.expander("🔎 NLP insight", expanded=False):
         st.write(nlp_data)
 
-    # >>> Snapshot ULTIMO input + predizione (persiste tra i rerun)
-    _pred = str(nlp_data.get("intent", "general") or "general")
-    _score = float(nlp_data.get("score", 0.0) or 0.0)
-    st.session_state["corr_snapshot"] = {
-        "text": san_user,
-        "predicted_intent": _pred,
-        "predicted_score": _score,
-    }
-    st.caption("🖊️ Puoi correggere l'intent di questo messaggio nel pannello in fondo alla pagina.")
-
-    # >>> NUOVO: rileva cambio argomento e imposta il taglio del contesto
-    _prev_intent = st.session_state.get("last_intent", "general")
-    _new_intent  = _pred
-    _new_score   = _score
-    switch = (_new_intent != _prev_intent and _new_score >= INTENT_SWITCH_THR)
-    if switch:
-        # taglia il contesto PRIMA della generazione: da qui in avanti si riparte "pulito"
-        st.session_state["topic_cut_idx"] = len(st.session_state.history) - 1  # indice del messaggio utente appena aggiunto
-        st.info("🔀 Nuovo argomento rilevato: isolo il contesto precedente per questa risposta.")
-        write_nlp_log({
-            "event": "topic_switch",
-            "from": _prev_intent,
-            "to": _new_intent,
-            "score": _new_score,
-            "source": "streamlit_topic_fence"
-        })
-    # aggiorna l'ultimo intent visto
-    st.session_state["last_intent"] = _new_intent
-
     engine_now = st.session_state.get("engine", "openai")
-    # Prompt arricchito (di default)
-    enriched_user = compose_prompt(san_user, nlp_data)
-    # Su OLLAMA inviamo SOLO la domanda pulita
-    if engine_now == "ollama":
-        enriched_user = san_user
-
     intent = nlp_data.get("intent", "general")
-    system_text = system_prompt_for_intent(intent)
-    # >>> Istruzione globale: rispondi solo all'ultimo messaggio
-    system_text += " Rispondi riferendoti soltanto al messaggio più recente dell'utente; ignora il contesto precedente salvo riferimenti espliciti."
-    if engine_now == "ollama":
-        # PATCH A: regole più strette per lingua/stile (Ollama)
-        system_text += (
-            " Rispondi esclusivamente in italiano semplice e corretto. "
-            "Evita parole inventate, sigle casuali e MAIUSCOLE nel mezzo delle parole; non usare inglese. "
-            "Se non sei sicuro, rispondi in modo conciso senza riempitivi."
+
+    # Costruzione messaggi:
+    # OPENAI/HF -> system dinamico + storia breve + prompt arricchito (+ didattica se ON)
+    # OLLAMA    -> NO system runtime, NO didattica; SOLO ultimo input pulito (Modelfile governa il SYSTEM)
+    if engine_now in ("openai", "hugging"):
+        system_text = system_prompt_for_intent(intent)
+        system_text += " Rispondi riferendoti soltanto all'ultimo messaggio dell'utente; ignora il contesto precedente salvo riferimenti espliciti."
+        didactic_suffix = (
+            "\n\nStile didattico: organizza a sezioni con titoli brevi, definizioni chiare, esempi pratici e, in chiusura, 3 domande-quiz con relative risposte."
+            if st.session_state.get("didactic", False) else ""
         )
-    didactic_suffix = (
-        "\n\nStile didattico: organizza a sezioni con titoli brevi, definizioni chiare, esempi pratici e, in chiusura, 3 domande-quiz con relative risposte."
-        if st.session_state.get("didactic", True) else ""
-    )
-
-    # History corta + sanitizzazione → DALLA FENCE IN POI
-    _cut = int(st.session_state.get("topic_cut_idx", 0))
-    _history_for_ctx = st.session_state.history[_cut:-1]  # dalla fence fino PRIMA dell'input corrente
-    short_history = _short_history_by_chars(_history_for_ctx, max_chars=9000)
-    short_history = [{"role": m["role"], "content": _sanitize_meta(m.get("content",""))} for m in short_history]
-
-    base_messages = [{"role": "system", "content": system_text}] + short_history + [
-        {"role": "user", "content": enriched_user + didactic_suffix}
-    ]
+        short_history = _short_history_by_chars(st.session_state.history[:-1], max_chars=9000)
+        short_history = [{"role": m["role"], "content": _sanitize_meta(m.get("content",""))} for m in short_history]
+        base_messages = [{"role": "system", "content": system_text}] + short_history + [
+            {"role": "user", "content": compose_prompt(san_user, nlp_data) + didactic_suffix}
+        ]
+    else:
+        # OLLAMA: prompt minimale (evita conflitti con SYSTEM nel Modelfile)
+        base_messages = [{"role": "user", "content": san_user}]
 
     with st.chat_message("assistant"):
         t0 = time.time()
         reply = ""
-        # Spinner + placeholder output
-        spinner = st.empty()
-        spinner_shown = True
-        spinner.markdown(_compass_spinner("Sto generando la risposta…"), unsafe_allow_html=True)
-        out = st.empty()
 
         try:
             if st.session_state.get("streaming_on", True):
+                placeholder = st.empty()
                 pieces = []
-                last = time.time()
-                for delta in stream_chat(base_messages, model_override=(
-                    st.session_state["openai_model"] if engine_now == "openai"
-                    else st.session_state["hf_model"] if engine_now == "hugging"
-                    else st.session_state["ollama_model"]
-                )):
-                    # STOP forzato dalla UI
-                    if st.session_state.get("stop_generation"):
-                        st.session_state["stop_generation"] = False
-                        break
-
-                    now = time.time()
-                    # hard-timeout anti-zombie: se per 8s non arrivano token → esci
-                    if now - last > 8:
-                        break
-
+                def _should_stop_cb() -> bool:
+                    return bool(st.session_state.get("stop_generation"))
+                for delta in stream_chat(
+                    base_messages,
+                    model_override=(
+                        st.session_state["openai_model"] if engine_now == "openai"
+                        else st.session_state["hf_model"] if engine_now == "hugging"
+                        else st.session_state["ollama_model"]
+                    ),
+                    should_stop=_should_stop_cb,
+                    idle_timeout=8.0,
+                    heartbeat_sec=2.0,
+                ):
                     if not isinstance(delta, str) or not delta.strip():
                         continue
-                    last = now
                     pieces.append(delta)
                     text = "".join(pieces)
                     text = _strip_drift_lines(_strip_drift_prefix(text))
-
-                    if spinner_shown:
-                        spinner.empty()
-                        spinner_shown = False
-                    out.markdown(text)
+                    placeholder.markdown(text)
 
                 reply = "".join(pieces).strip()
                 if not reply:
                     raise RuntimeError("Nessun testo dallo stream")
             else:
-                tmp = call_chat(base_messages, model_override=(
-                    st.session_state["openai_model"] if engine_now == "openai"
-                    else st.session_state["hf_model"] if engine_now == "hugging"
-                    else st.session_state["ollama_model"]
-                ))
-                reply = _strip_drift_lines(_strip_drift_prefix(tmp))
-                spinner.empty()
-                spinner_shown = False
-                out.markdown(reply)
-
-            # AUTO-CONTINUE: se si ferma a metà (Ollama) e non c'è <<FINE>>
-            if engine_now == "ollama" and _looks_cutoff(reply) and "<<FINE>>" not in reply:
-                msgs = build_continue_only_messages(
-                    system_once=system_text,
-                    history=[{"role":"user","content": enriched_user + didactic_suffix},
-                             {"role":"assistant","content": reply}],
-                    final_text_tail=_tail(reply, 3000),
-                    round_words=800,
-                    didactic=st.session_state.get("didactic", False),
-                )
-                more = _strip_drift_lines(_strip_drift_prefix(call_chat_smart(msgs, temperature=0.7)))
-                if more and more.strip():
-                    more = more.replace("<<FINE>>", "").strip()
-                    reply = (reply + ("\n\n" if not reply.endswith("\n\n") else "") + more).strip()
-                    out.markdown(reply)
-
-            # PATCH C: repair-pass se output rumoroso (Ollama)
-            if engine_now == "ollama" and _looks_noisy(reply):
-                guard_sys = (
-                    "Sei un editor. Riscrivi il testo seguente in italiano chiaro e corretto "
-                    "in 5–8 frasi, eliminando parole inventate, sigle casuali e parti senza senso. "
-                    "Se qualcosa è scorretto o non verificabile, omettilo. Non usare inglese."
-                )
-                msgs_fix = [
-                    {"role": "system", "content": guard_sys},
-                    {"role": "user", "content": "TESTO DA RISCRIVERE:\n\n" + reply}
-                ]
-                try:
-                    fixed = call_chat_smart(msgs_fix, temperature=0.2)
-                    if fixed and len(fixed.strip()) > 120:
-                        reply = fixed.strip()
-                        out.markdown(reply)
-                except Exception:
-                    pass
-
-        except Exception as e:
-            try:
-                if spinner_shown:
-                    spinner.empty()
-            except Exception:
-                pass
-            if not st.session_state.get("engine_lock", False):
-                try:
-                    reply = call_chat_smart(base_messages, model_override=(
+                reply = call_chat(
+                    base_messages,
+                    model_override=(
                         st.session_state["openai_model"] if engine_now == "openai"
                         else st.session_state["hf_model"] if engine_now == "hugging"
                         else st.session_state["ollama_model"]
-                    ))
+                    )
+                )
+                reply = _strip_drift_lines(_strip_drift_prefix(reply))
+                st.markdown(reply)
+        except Exception as e:
+            if not st.session_state.get("engine_lock", False):
+                try:
+                    reply = call_chat_smart(
+                        base_messages,
+                        model_override=(
+                            st.session_state["openai_model"] if engine_now == "openai"
+                            else st.session_state["hf_model"] if engine_now == "hugging"
+                            else st.session_state["ollama_model"]
+                        )
+                    )
                     reply = _strip_drift_lines(_strip_drift_prefix(reply))
-                    out.markdown(reply)
+                    st.markdown(reply)
                 except Exception as e2:
                     reply = f"⚠️ Errore modello: {str(e2).splitlines()[0]}"
-                    out.markdown(reply)
+                    st.markdown(reply)
             else:
                 reply = f"⚠️ Errore modello: {str(e).splitlines()[0]}"
-                out.markdown(reply)
+                st.markdown(reply)
 
-        log.info(f"ENGINE={engine_now} THINKING={st.session_state.get('thinking', False)} ELAPSED={time.time()-t0:.1f}s")
+        log.info(f"ENGINE={engine_now} DIDACTIC={st.session_state.get('didactic', False)} ELAPSED={time.time()-t0:.1f}s")
 
     st.session_state.history.append({"role": "assistant", "content": reply})
     if st.session_state.get("persist", True):
         save_memory(st.session_state.history)
 
-# === PANNELLO PERSISTENTE: Correzione intent dell’ultimo messaggio ===========
+# ============== Pannello: Correzione intent ultimo messaggio =================
 st.divider()
 st.subheader("🖊️ Correzione intent dell’ultimo messaggio")
 
-_snapshot = st.session_state.get("corr_snapshot")
-if not _snapshot:
-    st.caption("Invia un messaggio: qui potrai correggerne l'intent.")
-else:
-    _text = _snapshot.get("text") or ""
-    _pred = _snapshot.get("predicted_intent") or "general"
-    _score = float(_snapshot.get("predicted_score") or 0.0)
-    st.write(f"**Testo:** “{_text[:160]}{'…' if len(_text)>160 else ''}”")
-    st.write(f"**Predetto:** `{_pred}` — confidenza: {_score:.2f}")
+corr_snapshot = {
+    "text": "",
+    "predicted_intent": "general",
+    "predicted_score": 0.0,
+}
+try:
+    last_user_msg = next((m for m in reversed(st.session_state.history) if m.get("role") == "user"), None)
+    if last_user_msg:
+        nlp = analyze_text(last_user_msg.get("content", ""))
+        corr_snapshot["text"] = last_user_msg.get("content", "")
+        corr_snapshot["predicted_intent"] = str(nlp.get("intent", "general") or "general")
+        corr_snapshot["predicted_score"] = float(nlp.get("score", 0.0) or 0.0)
+except Exception:
+    pass
 
-    _labels = ["coding","business","nutrition","calendar","study","health","motivation","finance","science","general"]
-    try:
-        _default_idx = _labels.index(_pred)
-    except Exception:
-        _default_idx = _labels.index("general")
+text_preview = corr_snapshot["text"][:160] + ("…" if len(corr_snapshot["text"]) > 160 else "")
+st.write(f"**Testo:** “{text_preview}”" if text_preview else "_Invia un messaggio per vedere il pannello qui._")
+st.write(f"**Predetto:** `{corr_snapshot['predicted_intent']}` — confidenza: {corr_snapshot['predicted_score']:.2f}")
 
-    _corr = st.selectbox("Seleziona l'intent corretto", _labels, index=_default_idx, key="corr_global_select")
-    if st.button("💾 Salva correzione intent", key="corr_global_save"):
-        ok, err = write_nlp_log({
-            "text": _text,
-            "predicted_intent": _pred,
-            "predicted_score": _score,
-            "correct_intent": _corr,
-            "source": "streamlit_correction"
-        })
-        if ok:
-            st.success("Correzione salvata nei log.")
-        else:
-            st.error(f"Correzione NON salvata: {err}")
-        st.caption(f"File log correzioni: `{LOG_FILE}`")
+labels = ["coding","business","nutrition","calendar","study","health","motivation","finance","science","general"]
+try:
+    default_idx = labels.index(corr_snapshot["predicted_intent"])
+except Exception:
+    default_idx = labels.index("general")
 
-    # Expander: vedere subito le ultime correzioni
-    with st.expander("🗂️ Correzioni recenti (streamlit_correction)"):
-        try:
-            st.caption(f"Percorso log: `{LOG_FILE}`")
-            rows = []
-            if LOG_FILE.exists():
-                with open(LOG_FILE, "r", encoding="utf-8") as f:
-                    lines = [ln for ln in f if '"source":"streamlit_correction"' in ln]
-                    for ln in lines[-10:]:
-                        obj = json.loads(ln)
-                        rows.append(
-                            f"- `{obj.get('correct_intent')}` ← \"{(obj.get('text') or '')[:100]}\"  "
-                            f"(pred: {obj.get('predicted_intent')} {obj.get('predicted_score')})"
-                        )
-            st.markdown("\n".join(rows) if rows else "_Nessuna correzione salvata ancora._")
-        except Exception as _e:
-            st.info(f"Log non leggibile: {_e}")
+corr_sel = st.selectbox("Seleziona l'intent corretto", labels, index=default_idx, key="corr_global_select")
+if st.button("💾 Salva correzione intent"):
+    st.success(f"Intent aggiornato in sessione: {corr_sel}")

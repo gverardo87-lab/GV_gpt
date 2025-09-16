@@ -1,16 +1,16 @@
 # core/engine.py
 # -----------------------------------------------------------------------------
 # Motori supportati:
-#   - OpenAI (chat completions, streaming/non-streaming)
-#   - Hugging Face Inference API (mid-tier di test, non-stream; "finto streaming")
-#   - Ollama locale (/api/chat, streaming/non-streaming)
+#   - OpenAI (chat completions, streaming/non-stream)
+#   - Hugging Face Inference API (non-stream; "finto streaming" opzionale)
+#   - Ollama locale (/api/chat, streaming/non-stream)
 #
 # Fallback smart (se GV_ENGINE_LOCK=OFF):
 #   1) prova engine corrente
-#   2) se engine=openai e l'errore indica 429/quota -> passa a hugging
+#   2) se engine=openai e 429/quota -> passa a hugging
 #   3) altrimenti prova ollama come rete di sicurezza
 #
-# Esporta anche build_continue_only_messages dal modulo core.context.
+# Re-export helper per longform "continue-only" (se presente in core.context).
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -18,31 +18,31 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Dict, Generator, List, Optional, Callable
 
 import requests
 
 # ---- Import motori locali ---------------------------------------------------
 try:
     from core.ollama_client import call_ollama_chat, stream_ollama_chat
-except Exception as _e:
+except Exception:
     call_ollama_chat = None  # type: ignore
     stream_ollama_chat = None  # type: ignore
 
 try:
     from core.hugging_client import call_hugging_chat
-except Exception as _e:
+except Exception:
     call_hugging_chat = None  # type: ignore
 
-# NEW: usa gpt_clienti come client unico per OpenAI
+# OpenAI client wrapper se presente
 try:
     from core import gpt_clienti
 except Exception:
-    gpt_clienti = None
+    gpt_clienti = None  # type: ignore
 
-# Re-export helper per longform "continue-only"
+# Re-export helper per longform "continue-only" (se esiste)
 try:
-    from core.context import build_continue_only_messages
+    from core.context import build_continue_only_messages  # type: ignore
 except Exception:
     def build_continue_only_messages(
         *,
@@ -73,6 +73,17 @@ def _env(name: str, default: Optional[str] = None) -> Optional[str]:
 def _is_true(value: Optional[str]) -> bool:
     return (value or "").lower() in ("1", "true", "yes", "on")
 
+def _with_retry(fn, attempts: int = 2, base_delay: float = 0.6):
+    last = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if i < attempts - 1:
+                time.sleep(base_delay * (2 ** i))
+    raise last
+
 # ============================== OpenAI client ================================
 
 def _openai_base_url() -> str:
@@ -91,17 +102,6 @@ def _openai_headers() -> Dict[str, str]:
         "Accept": "application/json",
     }
 
-def _with_retry(fn, attempts: int = 2, base_delay: float = 0.6):
-    last = None
-    for i in range(attempts):
-        try:
-            return fn()
-        except Exception as e:
-            last = e
-            if i < attempts - 1:
-                time.sleep(base_delay * (2 ** i))
-    raise last
-
 def _parse_openai_stream_line(raw_line: bytes) -> Optional[Dict[str, Any]]:
     if not raw_line:
         return None
@@ -109,9 +109,7 @@ def _parse_openai_stream_line(raw_line: bytes) -> Optional[Dict[str, Any]]:
         line = raw_line.decode("utf-8", errors="ignore").strip()
     except Exception:
         return None
-    if not line:
-        return None
-    if not line.startswith("data:"):
+    if not line or not line.startswith("data:"):
         return None
     payload = line[len("data:"):].strip()
     if payload == "[DONE]":
@@ -121,16 +119,20 @@ def _parse_openai_stream_line(raw_line: bytes) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
-# MODIFICATO: ora usa gpt_clienti.call_gpt_chat se disponibile
 def _call_openai_nonstream(
     messages: List[Dict[str, str]],
+    *,
     model: Optional[str] = None,
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
     top_p: Optional[float] = None,
     timeout: Optional[int] = None,
 ) -> str:
+    """
+    Non-stream: preferisce core.gpt_clienti se disponibile, altrimenti chiama REST.
+    """
     if gpt_clienti is not None:
+        # API interna tua; tipicamente accetta (messages, temperature)
         return gpt_clienti.call_gpt_chat(messages, temperature=temperature or 0.7)
 
     url = _openai_base_url() + "/chat/completions"
@@ -161,16 +163,22 @@ def _call_openai_nonstream(
     except Exception:
         return json.dumps(data, ensure_ascii=False)
 
-# MODIFICATO: ora usa gpt_clienti.stream_gpt_chat se disponibile
 def _stream_openai(
     messages: List[Dict[str, str]],
+    *,
     model: Optional[str] = None,
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
     top_p: Optional[float] = None,
     timeout: Optional[int] = None,
+    should_stop: Optional[Callable[[], bool]] = None,  # non può interrompere HTTP, ma lo accettiamo per compat
 ) -> Generator[str, None, None]:
-    if gpt_clienti is not None:
+    """
+    Stream SSE OpenAI. Nota: non è possibile interrompere la connessione HTTP già aperta
+    senza chiudere la sessione a monte; il callback should_stop è solo per compatibilità.
+    """
+    if gpt_clienti is not None and hasattr(gpt_clienti, "stream_gpt_chat"):
+        # Se esiste la tua implementazione, usala (torna un generator)
         return gpt_clienti.stream_gpt_chat(messages, temperature=temperature or 0.7)
 
     url = _openai_base_url() + "/chat/completions"
@@ -196,22 +204,44 @@ def _stream_openai(
     resp = _with_retry(_do_post)
     resp.raise_for_status()
 
-    for raw in resp.iter_lines(decode_unicode=False, delimiter=b"\n"):
-        obj = _parse_openai_stream_line(raw)
-        if not obj:
-            continue
-        if obj.get("done") is True:
-            break
+    def _gen():
+        last = time.time()
+        for raw in resp.iter_lines(decode_unicode=False, delimiter=b"\n"):
+            # Compat: se il chiamante chiede stop, usciamo dal loop generator
+            if should_stop and should_stop():
+                break
+            obj = _parse_openai_stream_line(raw)
+            if not obj:
+                # semplice idle/heartbeat control lato client
+                now = time.time()
+                if now - last > 8:
+                    break
+                continue
+            if obj.get("done") is True:
+                break
+            try:
+                delta = obj["choices"][0]["delta"].get("content")
+            except Exception:
+                delta = None
+            if isinstance(delta, str) and delta:
+                last = time.time()
+                yield delta
         try:
-            delta = obj["choices"][0]["delta"].get("content")
+            resp.close()
         except Exception:
-            delta = None
-        if isinstance(delta, str) and delta:
-            yield delta
+            pass
+
+    return _gen()
 
 # ============================== Public API ===================================
 
 def call_chat(messages: List[Dict[str, str]], **kwargs) -> str:
+    """
+    Invoca il motore configurato (GV_ENGINE). Supporta:
+      - OpenAI: temperature, top_p, max_tokens
+      - Hugging: temperature, max_tokens -> mappato su max_new_tokens
+      - Ollama: options (temperature, top_p, num_predict)
+    """
     engine = (_env("GV_ENGINE", "openai") or "openai").lower()
     model_override = kwargs.get("model") or kwargs.get("model_override")
 
@@ -230,7 +260,7 @@ def call_chat(messages: List[Dict[str, str]], **kwargs) -> str:
             raise RuntimeError("Modulo Hugging Face non disponibile.")
         return call_hugging_chat(
             messages,
-            model=os.getenv("HUGGINGFACE_MODEL"),
+            model=os.getenv("HUGGINGFACE_MODEL") if model_override is None else model_override,
             temperature=kwargs.get("temperature"),
             max_new_tokens=kwargs.get("max_tokens") or int(os.getenv("HUGGINGFACE_MAX_NEW_TOKENS", "512")),
             top_p=kwargs.get("top_p"),
@@ -258,8 +288,9 @@ def call_chat(messages: List[Dict[str, str]], **kwargs) -> str:
 
 def stream_chat(messages: List[Dict[str, str]], **kwargs) -> Generator[str, None, None]:
     """
-    Streaming unificato. Supporta per Ollama:
-      - should_stop (callable opzionale) per hard-stop immediato
+    Streaming unificato.
+    Supporta per Ollama:
+      - should_stop (callable) per hard-stop immediato
       - idle_timeout (float, env OLLAMA_IDLE_TIMEOUT default 8s)
       - heartbeat_sec (float, env OLLAMA_HEARTBEAT_SEC default 2s)
     """
@@ -274,14 +305,16 @@ def stream_chat(messages: List[Dict[str, str]], **kwargs) -> Generator[str, None
             max_tokens=kwargs.get("max_tokens"),
             top_p=kwargs.get("top_p"),
             timeout=kwargs.get("timeout"),
+            should_stop=kwargs.get("should_stop"),
         )
 
     if engine == "hugging":
+        # Non abbiamo stream HF qui; simuliamo un "blocco unico"
         if call_hugging_chat is None:
             raise RuntimeError("Modulo Hugging Face non disponibile.")
         txt = call_hugging_chat(
             messages,
-            model=os.getenv("HUGGINGFACE_MODEL"),
+            model=os.getenv("HUGGINGFACE_MODEL") if model_override is None else model_override,
             temperature=kwargs.get("temperature"),
             max_new_tokens=kwargs.get("max_tokens") or int(os.getenv("HUGGINGFACE_MAX_NEW_TOKENS", "512")),
             top_p=kwargs.get("top_p"),
@@ -303,7 +336,6 @@ def stream_chat(messages: List[Dict[str, str]], **kwargs) -> Generator[str, None
         if kwargs.get("max_tokens") is not None:
             options["num_predict"] = int(kwargs["max_tokens"])
 
-        # ⬇️ Nuovi parametri pass-through per stop/timeout
         should_stop = kwargs.get("should_stop")
         idle_timeout = float(_env("OLLAMA_IDLE_TIMEOUT", "8") or "8")
         heartbeat_sec = float(_env("OLLAMA_HEARTBEAT_SEC", "2") or "2")
@@ -313,7 +345,6 @@ def stream_chat(messages: List[Dict[str, str]], **kwargs) -> Generator[str, None
             model=model_override or None,
             options=options or None,
             timeout=kwargs.get("timeout"),
-            # nuovi argomenti
             idle_timeout=kwargs.get("idle_timeout", idle_timeout),
             heartbeat_sec=kwargs.get("heartbeat_sec", heartbeat_sec),
             should_stop=should_stop,
@@ -325,6 +356,9 @@ def stream_chat(messages: List[Dict[str, str]], **kwargs) -> Generator[str, None
     return _empty()
 
 def call_chat_smart(messages: List[Dict[str, str]], **kwargs) -> str:
+    """
+    Esegue la chiamata con fallback automatico se GV_ENGINE_LOCK non è attivo.
+    """
     lock = _is_true(os.getenv("GV_ENGINE_LOCK", "0"))
     current = (_env("GV_ENGINE", "openai") or "openai").lower()
 
@@ -335,6 +369,7 @@ def call_chat_smart(messages: List[Dict[str, str]], **kwargs) -> str:
             raise
         err = str(e1).lower()
 
+        # Se OpenAI quota/429 -> prova HF
         if current == "openai" and any(k in err for k in ("429", "quota", "insufficient", "rate limit")):
             try:
                 os.environ["GV_ENGINE"] = "hugging"
@@ -344,6 +379,7 @@ def call_chat_smart(messages: List[Dict[str, str]], **kwargs) -> str:
             finally:
                 os.environ["GV_ENGINE"] = current
 
+        # Prova Ollama come rete di sicurezza
         try:
             os.environ["GV_ENGINE"] = "ollama"
             return call_chat(messages, **kwargs)
