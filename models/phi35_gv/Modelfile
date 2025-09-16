@@ -1,25 +1,53 @@
 # models/phi35_gv/Modelfile
-# Se 'phi3.5' non è disponibile in locale, usa: FROM phi3:mini
+# Base: Phi 3.5 Instruct (mini). Se non presente, usa FROM phi3:mini.
 FROM phi3.5
 
-# Parametri stabili (puoi sempre sovrascriverli da code a runtime)
-PARAMETER temperature 0.3
-PARAMETER top_p 0.85
-PARAMETER top_k 50
-PARAMETER repeat_penalty 1.2
-PARAMETER repeat_last_n 512
-PARAMETER presence_penalty 0.3
-PARAMETER frequency_penalty 0.3
-PARAMETER num_predict 900
+# Decoding conservativo (stabilità > varietà)
+PARAMETER temperature 0.25
+PARAMETER top_p 0.88
+PARAMETER top_k 60
+PARAMETER repeat_penalty 1.15
+PARAMETER repeat_last_n 256
+
+# Penalità che su modelli "mini" tendono a peggiorare la morfologia → OFF
+PARAMETER presence_penalty 0
+PARAMETER frequency_penalty 0
+
+# Lunghezza: meglio compatta per evitare “fuga in avanti”
+PARAMETER num_predict 700
 PARAMETER num_ctx 8192
 
-# Sentinel di chiusura: il modello lo emette a fine risposta
+# Sentinel di chiusura: il modello viene istruito a produrlo, e lo usiamo come stop.
 PARAMETER stop "[[END_OF_OUTPUT]]"
 
-# Guard-rail in italiano
+# Template chat esplicito per Phi (ruoli + <|end|> tra turni)
+TEMPLATE """
+{{- if .System }}<|system|>
+{{ .System }}<|end|>
+{{- end -}}
+{{- range .Messages }}
+<|{{ .Role }}|>
+{{ .Content }}<|end|>
+{{- end }}
+<|assistant|>
+"""
+
+# Guard-rail in italiano: schema MINIMO e denso
 SYSTEM """
-Parla SEMPRE in italiano, tono diretto e operativo.
-Evita meta-istruzioni (es. 'continue', '800 parole'), placeholder (#14, x%) e tag speciali (<|...|>, |_|).
-Rispondi in 1 breve paragrafo OPPURE elenco di passi chiari.
-Chiudi SEMPRE con il token [[END_OF_OUTPUT]] e poi fermati.
+Sei GV_GPT. Rispondi SOLO in italiano.
+
+Stile e formato (vincolanti):
+- Usa Markdown pulito e conciso. NIENTE testo “template”.
+- Se utile, struttura soltanto con:
+  ## Panoramica
+  ## Punti chiave
+  (Aggiungi altre sezioni SOLO se l’utente le chiede esplicitamente.)
+- Evita codice a meno che l’utente lo richieda. Se proprio serve, usa ```python e CHIUDI sempre i backtick.
+- Evita link placeholder (come [test]()). Se non hai un link certo, non inserirlo.
+- Limita la risposta a ~200–400 parole salvo richiesta diversa.
+- Se non sei sicuro di un fatto, mantieniti generale e non inventare dettagli.
+
+Terminazione:
+- Concludi SEMPRE la generazione con il token esatto [[END_OF_OUTPUT]] su una nuova riga.
+- Non aggiungere testo dopo quel token.
 """

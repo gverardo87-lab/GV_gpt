@@ -6,8 +6,8 @@
 # - Didattica opzionale (solo OpenAI/HF)
 # - Streaming: OpenAI/Ollama; HuggingFace pseudo-stream (tutto in un colpo)
 # - Memoria persistente, export, diagnostica, slider num_predict e temperatura per Ollama
-# - Toggle “Alta leggibilità” per passare da scenografico a pro
-# - Sanitizer anti meta-marker + filtri anti drift (“Instruction/Your task/Begin by”)
+# - Toggle “Alta leggibilità”
+# - Sanitizer anti meta-marker + filtri anti drift
 # - Pannello “🖊️ Correzione intent”
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -189,8 +189,46 @@ def _short_history_by_chars(history_msgs: list, max_chars: int = 9000) -> list:
             break
     return list(reversed(sel))
 
+# === Post-formatter di impaginazione (micro) =================================
+def post_format_response(text: str) -> str:
+    """
+    Correzioni leggere:
+    - chiude blocchi ``` dispari
+    - rimuove link placeholder [titolo]()
+    - normalizza heading profondi a '## '
+    - bullet coerenti ('- ')
+    - sopprime boilerplate inglese comune in righe isolate
+    - normalizza spazi finali e ritorni multipli
+    """
+    if not text:
+        return text
+    s = text
+
+    # Chiudi blocchi ``` dispari
+    if s.count("```") % 2 == 1:
+        s += "\n```"
+
+    # Togli link placeholder [titolo]()
+    s = re.sub(r"\[([^\]]+)\]\(\s*\)", r"\1", s)
+
+    # Normalizza heading troppo profondi a "## "
+    s = re.sub(r"^\s*#{4,}\s*", "## ", s, flags=re.MULTILINE)
+
+    # Normalizza bullet (• o * → "- ")
+    s = re.sub(r"^[\t ]*[•*]\s+", "- ", s, flags=re.MULTILINE)
+
+    # Sopprimi righe boilerplate in inglese comuni
+    s = re.sub(r"(?im)^\s*(ready to help|here (?:are|is)|let'?s |i can help)\b.*$", "", s)
+
+    # Spazi/punteggiatura
+    s = re.sub(r"[ \t]+$", "", s, flags=re.MULTILINE)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+
+    return s.strip()
+
 # === THEME (nautico chiaro) & GLOBAL CSS ====================================
 def _nautical_css(pro_mode: bool = False) -> str:
+    # Versione più compatta: font più piccoli, line-height più bassa, padding ridotto
     if pro_mode:
         return """
         <style>
@@ -214,44 +252,55 @@ def _nautical_css(pro_mode: bool = False) -> str:
           [data-testid="stAppViewContainer"] .main .block-container{
             background: var(--card);
             border: 1px solid var(--border);
-            border-radius: 18px;
-            box-shadow: 0 6px 26px rgba(15, 23, 42, .04);
-            padding: 1rem 1.25rem 1.5rem 1.25rem;
+            border-radius: 14px;
+            box-shadow: 0 4px 20px rgba(15, 23, 42, .04);
+            padding: .6rem .8rem .9rem .8rem;
           }
           .main .block-container, .main .block-container p, .main .block-container li, 
           .main .block-container label, .main .block-container h1, .main .block-container h2, .main .block-container h3{
             color: var(--fg);
             font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+            font-size: 0.95rem;
+            line-height: 1.45;
           }
+          .main .block-container h1 { font-size: 1.25rem; margin: .35rem 0 .25rem; }
+          .main .block-container h2 { font-size: 1.1rem; margin: .35rem 0 .2rem; }
+          .main .block-container h3 { font-size: 1.0rem; margin: .3rem 0 .15rem; }
           .brand-title{
             font-family: 'Plus Jakarta Sans', Inter, system-ui;
-            font-weight: 700; letter-spacing: .2px;
-            font-size: clamp(24px, 3.6vw, 36px);
+            font-weight: 700; letter-spacing: .1px;
+            font-size: clamp(18px, 2.4vw, 26px);
             color: var(--fg);
           }
-          .brand-sub{ color: var(--fg-muted); font-size: 14px; margin-top: .25rem; }
+          .brand-sub{ color: var(--fg-muted); font-size: 12px; margin-top: .2rem; }
           .hero-card{
-            border-radius: 16px; padding: 14px 18px; border: 1px solid var(--border);
+            border-radius: 12px; padding: 10px 12px; border: 1px solid var(--border);
             background: #fffffff6;
           }
           .side-card{
-            border-radius: 16px; padding: 12px; border: 1px solid var(--border); background: #ffffff;
+            border-radius: 12px; padding: 8px; border: 1px solid var(--border); background: #ffffff;
             display:flex;align-items:center;justify-content:center; aspect-ratio: 1.8/1;
           }
           [data-testid="stChatMessage"] > div:first-child{
-            border-radius: 12px !important; border: 1px solid var(--border); background: var(--bubble);
+            border-radius: 10px !important; border: 1px solid var(--border); background: var(--bubble);
+            padding: 8px 10px !important;
           }
           [data-testid="stChatInput"] textarea{
             background: var(--input-bg) !important; border: 1px solid var(--border) !important;
             color: var(--fg) !important; caret-color: var(--accent) !important;
+            font-size: 0.95rem !important;
           }
           [data-testid="stChatInput"] textarea::placeholder{ color: var(--placeholder) !important; opacity: 1 !important; }
           .stTextInput input, .stTextArea textarea{
             background: var(--input-bg) !important; border: 1px solid var(--border) !important; color: var(--fg) !important;
+            font-size: 0.95rem !important;
           }
           .stTextInput input::placeholder, .stTextArea textarea::placeholder{ color: var(--placeholder) !important; opacity: 1 !important; }
           .main .block-container a{ color: var(--link); text-decoration: none; }
-          .wave-wrap{height: 30px; overflow: hidden; margin-top: 6px;}
+          .wave-wrap{height: 26px; overflow: hidden; margin-top: 2px;}
+          [data-testid="stMarkdownContainer"] p { margin: .25rem 0; }
+          [data-testid="stMarkdownContainer"] ul { margin: .25rem 0 .3rem 1.1rem; }
+          [data-testid="stMarkdownContainer"] li { margin: .05rem 0; }
           [data-testid="stChatMessage"] p, [data-testid="stMarkdownContainer"] p { overflow-wrap: break-word; white-space: pre-wrap; }
         </style>
         """
@@ -269,43 +318,54 @@ def _nautical_css(pro_mode: bool = False) -> str:
           [data-testid="stAppViewContainer"] .main .block-container{
             background: var(--card);
             border: 1px solid var(--border);
-            border-radius: 18px;
-            box-shadow: 0 8px 24px rgba(2,6,23,.06);
-            padding: 1rem 1.25rem 1.5rem 1.25rem;
+            border-radius: 14px;
+            box-shadow: 0 6px 18px rgba(2,6,23,.06);
+            padding: .7rem .9rem 1rem .9rem;
           }
           .main .block-container, .main .block-container p, .main .block-container li, 
           .main .block-container label, .main .block-container h1, .main .block-container h2, .main .block-container h3{
             color: var(--fg);
             font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+            font-size: 0.98rem;
+            line-height: 1.5;
           }
+          .main .block-container h1 { font-size: 1.28rem; margin: .4rem 0 .25rem; }
+          .main .block-container h2 { font-size: 1.14rem; margin: .35rem 0 .2rem; }
+          .main .block-container h3 { font-size: 1.02rem; margin: .3rem 0 .15rem; }
           .brand-title{
             font-family: 'Plus Jakarta Sans', Inter, system-ui;
-            font-weight: 700; letter-spacing: .2px;
-            font-size: clamp(26px, 4vw, 40px);
+            font-weight: 700; letter-spacing: .1px;
+            font-size: clamp(19px, 2.8vw, 28px);
             color: var(--fg);
           }
-          .brand-sub{ color: var(--fg-muted); font-size: 14px; margin-top: .25rem; }
+          .brand-sub{ color: var(--fg-muted); font-size: 13px; margin-top: .2rem; }
           .hero-card{
-            border-radius: 16px; padding: 14px 18px; border: 1px solid var(--border);
-            background: #fffffff6; box-shadow: 0 8px 24px rgba(2,6,23,.06);
+            border-radius: 12px; padding: 10px 12px; border: 1px solid var(--border);
+            background: #fffffff6; box-shadow: 0 6px 18px rgba(2,6,23,.06);
           }
           .side-card{
-            border-radius: 16px; padding: 12px; border: 1px solid var(--border); background: #ffffffbf;
+            border-radius: 12px; padding: 8px; border: 1px solid var(--border); background: #ffffffbf;
             display:flex;align-items:center;justify-content:center; aspect-ratio: 1.8/1;
           }
           [data-testid="stChatMessage"] > div:first-child{
-            border-radius: 12px !important; border: 1px solid var(--border); background: var(--bubble);
+            border-radius: 10px !important; border: 1px solid var(--border); background: var(--bubble);
+            padding: 8px 10px !important;
           }
           [data-testid="stChatInput"] textarea{
             background: var(--input-bg) !important; border: 1px solid var(--border) !important; color: var(--fg) !important; caret-color: var(--accent) !important;
+            font-size: 0.98rem !important;
           }
           [data-testid="stChatInput"] textarea::placeholder{ color: var(--placeholder) !important; opacity: 1 !important; }
           .stTextInput input, .stTextArea textarea{
             background: var(--input-bg) !important; border: 1px solid var(--border) !important; color: var(--fg) !important;
+            font-size: 0.98rem !important;
           }
           .stTextInput input::placeholder, .stTextArea textarea::placeholder{ color: var(--placeholder) !important; opacity: 1 !important; }
           .main .block-container a{ color: var(--link); text-decoration: none; }
-          .wave-wrap{height: 36px; overflow: hidden; margin-top: 6px;}
+          .wave-wrap{height: 28px; overflow: hidden; margin-top: 3px;}
+          [data-testid="stMarkdownContainer"] p { margin: .28rem 0; }
+          [data-testid="stMarkdownContainer"] ul { margin: .28rem 0 .35rem 1.15rem; }
+          [data-testid="stMarkdownContainer"] li { margin: .06rem 0; }
           [data-testid="stChatMessage"] p, [data-testid="stMarkdownContainer"] p { overflow-wrap: break-word; white-space: pre-wrap; }
         </style>
         """
@@ -332,7 +392,7 @@ def _sailboat_svg(width=220):
     </svg>
     """
 
-def _wave_svg(width="100%", height=36):
+def _wave_svg(width="100%", height=28):
     return f"""
     <svg width="{width}" height="{height}" viewBox="0 0 1440 120" preserveAspectRatio="none"
          xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -351,16 +411,16 @@ def render_hero(high_readability: bool = False, logo_bytes: bytes | None = None)
                 im = Image.open(BytesIO(logo_bytes))
                 st.image(im, use_column_width=True)
             except Exception:
-                st.markdown(_sailboat_svg(240), unsafe_allow_html=True)
+                st.markdown(_sailboat_svg(220), unsafe_allow_html=True)
         else:
-            st.markdown(_sailboat_svg(240), unsafe_allow_html=True)
+            st.markdown(_sailboat_svg(220), unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
     with c2:
         st.markdown(
             """
             <div class="hero-card">
               <div class="brand-title">GV_GPT — L’aria sta cambiando</div>
-              <div class="brand-sub">Tema nautico chiaro • leggibilità professionale • attenzione al dettaglio</div>
+              <div class="brand-sub">Tema nautico chiaro • impaginazione compatta • attenzione al dettaglio</div>
             </div>
             """,
             unsafe_allow_html=True
@@ -498,7 +558,7 @@ with st.sidebar:
         st.session_state["stop_generation"] = True
         st.toast("Interruzione richiesta", icon="🛑")
 
-    # ⬇️⬇️⬇️ BLOCCO RIPRISTINATO: MEMORIA
+    # 💾 Memoria
     st.header("💾 Memoria")
     st.session_state["persist"] = st.checkbox("Mantieni chat tra riavvii", value=st.session_state["persist"])
     c1, c2 = st.columns(2)
@@ -510,7 +570,6 @@ with st.sidebar:
         if st.button("🗑️ Cancella memoria salvata"):
             clear_memory()
             st.success("Memoria persistente cancellata.")
-    # ⬆️⬆️⬆️ FINE BLOCCO MEMORIA
 
     st.header("▶ Continua")
     has_chat_state = bool(st.session_state.get("history"))
@@ -552,7 +611,7 @@ if "history" not in st.session_state:
 # 7) Mostra conversazione
 for msg in st.session_state.history:
     with st.chat_message(msg["role"]):
-        st.markdown(f"<div style='padding:.25rem .25rem'>{msg['content']}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div style='padding:.2rem .25rem'>{msg['content']}</div>", unsafe_allow_html=True)
 
 # ---------- OUTLINE MANAGEMENT -----------------------------------------------
 def _update_outline_if_needed(full_text: str, every_round: int, round_idx: int, system_text: str):
@@ -600,6 +659,7 @@ if st.session_state.get("do_continue"):
             if _looks_restart(chunk) or _is_reduant(chunk, san_last_assistant) or _too_similar(chunk, san_last_assistant):
                 chunk = re.sub(r'(?is)^.{0,300}\n', '', chunk, count=1).strip()
             reply = (chunk or "").replace("<<FINE>>","").strip()
+            reply = post_format_response(reply)  # post-format finale
             st.markdown(reply if reply else "_(nessun avanzamento)_")
         except Exception as e:
             reply = "⚠️ Errore (continua): " + str(e).split("\n")[0]
@@ -629,8 +689,6 @@ if user:
     intent = nlp_data.get("intent", "general")
 
     # Costruzione messaggi:
-    # OPENAI/HF -> system dinamico + storia breve + prompt arricchito (+ didattica se ON)
-    # OLLAMA    -> NO system runtime, NO didattica; SOLO ultimo input pulito (Modelfile governa il SYSTEM)
     if engine_now in ("openai", "hugging"):
         system_text = system_prompt_for_intent(intent)
         system_text += " Rispondi riferendoti soltanto all'ultimo messaggio dell'utente; ignora il contesto precedente salvo riferimenti espliciti."
@@ -670,6 +728,7 @@ if user:
                 ):
                     if not isinstance(delta, str) or not delta.strip():
                         continue
+                    # ⬇️ join naturale, senza inserire spazi artificiali
                     pieces.append(delta)
                     text = "".join(pieces)
                     text = _strip_drift_lines(_strip_drift_prefix(text))
@@ -678,6 +737,12 @@ if user:
                 reply = "".join(pieces).strip()
                 if not reply:
                     raise RuntimeError("Nessun testo dallo stream")
+
+                # Post-format finale e refresh placeholder
+                reply = _strip_drift_lines(_strip_drift_prefix(reply))
+                reply = post_format_response(reply)
+                placeholder.markdown(reply)
+
             else:
                 reply = call_chat(
                     base_messages,
@@ -688,6 +753,7 @@ if user:
                     )
                 )
                 reply = _strip_drift_lines(_strip_drift_prefix(reply))
+                reply = post_format_response(reply)
                 st.markdown(reply)
         except Exception as e:
             if not st.session_state.get("engine_lock", False):
@@ -701,6 +767,7 @@ if user:
                         )
                     )
                     reply = _strip_drift_lines(_strip_drift_prefix(reply))
+                    reply = post_format_response(reply)
                     st.markdown(reply)
                 except Exception as e2:
                     reply = f"⚠️ Errore modello: {str(e2).splitlines()[0]}"
