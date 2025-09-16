@@ -721,7 +721,42 @@ if st.session_state.get("do_continue"):
                     round_words=800,
                     didactic=False,
                 )
-                chunk = call_chat_smart(msgs, temperature=0.7)
+                if engine_now == "ollama" and st.session_state.get("streaming_on", True):
+                    # Streaming per evitare lock della POST non-stream
+                    placeholder = st.empty()
+                    pieces = []
+                    stopped_by_sentinel = False
+                    for delta in stream_chat(
+                            msgs,
+                            model_override=st.session_state["ollama_model"],
+                            temperature=0.7,
+                            idle_timeout=8.0,
+                            heartbeat_sec=2.0,
+                    ):
+                        if not isinstance(delta, str) or delta == "":
+                            continue
+                        pieces.append(delta)
+                        joined = "".join(pieces)
+                        # Stop immediato su sentinel
+                        if any(s in joined for s in SENTINELS):
+                            for s in SENTINELS:
+                                if s in joined:
+                                    joined = joined.split(s, 1)[0]
+                                    stopped_by_sentinel = True
+                                    break
+                        # Light formatting durante lo stream
+                        placeholder.markdown(re.sub(r"(?m)^\s*#{4,}\s*", "## ", joined))
+                        if stopped_by_sentinel:
+                            break
+                    chunk = "".join(pieces)
+                    for s in SENTINELS:
+                        if s in chunk:
+                            chunk = chunk.split(s, 1)[0]
+                            break
+                else:
+                    # Non-stream con timeout difensivo
+                    chunk = call_chat_smart(msgs, temperature=0.7, timeout=120)
+
                 chunk = _strip_drift_lines(_strip_drift_prefix(chunk))
                 if _looks_restart(chunk) or _is_reduant(chunk, san_last_assistant) or _too_similar(chunk, san_last_assistant):
                     import re
@@ -757,10 +792,43 @@ if st.session_state.get("do_continue"):
 
         with st.chat_message("assistant"):
             try:
-                reply = call_chat_smart(msgs, temperature=0.6)
+                if engine_now == "ollama" and st.session_state.get("streaming_on", True):
+                    placeholder = st.empty()
+                    pieces = []
+                    stopped_by_sentinel = False
+                    for delta in stream_chat(
+                            msgs,
+                            model_override=st.session_state["ollama_model"],
+                            temperature=0.6,
+                            idle_timeout=8.0,
+                            heartbeat_sec=2.0,
+                    ):
+                        if not isinstance(delta, str) or delta == "":
+                            continue
+                        pieces.append(delta)
+                        joined = "".join(pieces)
+                        if any(s in joined for s in SENTINELS):
+                            for s in SENTINELS:
+                                if s in joined:
+                                    joined = joined.split(s, 1)[0]
+                                    stopped_by_sentinel = True
+                                    break
+                        placeholder.markdown(re.sub(r"(?m)^\s*#{4,}\s*", "## ", joined))
+                        if stopped_by_sentinel:
+                            break
+                    reply = "".join(pieces)
+                    for s in SENTINELS:
+                        if s in reply:
+                            reply = reply.split(s, 1)[0]
+                            break
+                    reply = reply.strip()
+                else:
+                    reply = call_chat_smart(msgs, temperature=0.6, timeout=120)
+
                 reply = _strip_drift_lines(_strip_drift_prefix(reply))
                 reply = post_format_response(reply)
                 st.markdown(reply)
+
             except Exception as e:
                 reply = f"⚠️ Errore (continua/approfondisci): {str(e).splitlines()[0]}"
                 st.markdown(reply)
