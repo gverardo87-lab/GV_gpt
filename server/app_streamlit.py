@@ -23,6 +23,7 @@ import json
 import time
 import re
 import difflib
+import hashlib  # ← PATCH: serve per _intent_key
 from datetime import datetime
 from io import BytesIO
 
@@ -52,6 +53,9 @@ from core.engine import (
 )
 from core.memory import load_memory, save_memory, clear_memory
 from core.logger import get_logger
+log = get_logger()
+log.info(f"INIT: persist={st.session_state.get('persist', True)} "
+         f"loaded_history={len(st.session_state.get('history', []))}")
 
 # NLP/Orchestrator – fallback soft se mancanti
 try:
@@ -172,16 +176,35 @@ def _too_similar(a: str, b: str, threshold: float = 0.86) -> bool:
     ratio = difflib.SequenceMatcher(None, a.strip().lower(), b.strip().lower()).ratio()
     return ratio >= threshold
 
+# ── PATCH: continue command detection & robust last-turn finder ──────────────
+CONT_RX = re.compile(
+    r"^(?:continua|prosegui|vai avanti|ancora|dammi(?:\s+di)?\s+pi[uù]|continua\s*pure)\s*[.!?]*$",
+    re.IGNORECASE
+)
+def _is_continue_cmd(s: str) -> bool:
+    return bool(CONT_RX.match((s or "").strip()))
+
 def _find_last_user_and_assistant(history: list) -> tuple[str, str]:
+    """
+    Cerca l'ultimo assistant e il relativo ultimo user NON di tipo 'continua'.
+    Evita che i comandi di continue si 'incollino' a turni vecchi.
+    """
     last_assistant = ""
     last_user = ""
+    skipping_trailing_continue = True
     for m in reversed(history):
-        if not last_assistant and m["role"] == "assistant":
-            last_assistant = m["content"]
-        elif m["role"] == "user":
-            last_user = m["content"]
+        role = m.get("role")
+        content = m.get("content", "")
+        if skipping_trailing_continue and role == "user" and _is_continue_cmd(content):
+            continue
+        skipping_trailing_continue = False
+        if not last_assistant and role == "assistant":
+            last_assistant = content
+        elif role == "user":
+            last_user = content
             break
     return last_user, last_assistant
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _looks_cutoff(txt: str) -> bool:
     if not txt:
@@ -465,7 +488,11 @@ st.session_state.setdefault("streaming_on", True)
 st.session_state.setdefault("stop_generation", False)
 st.session_state.setdefault("high_readability", True)
 st.session_state.setdefault("logo_bytes", None)
-st.session_state.setdefault("history", load_memory())  # <- init sicuro
+st.session_state.setdefault("history", load_memory() if st.session_state.get("persist", True)
+else []
+)
+# <- init sicuro
+st.session_state.setdefault("intent_overrides", {})     # ← PATCH: storage override intent
 
 with st.sidebar:
     st.header("⚙️ Aspetto")
@@ -577,7 +604,9 @@ with st.sidebar:
     with c1:
         if st.button("🧹 Svuota chat"):
             st.session_state.history = []
-            st.success("Chat svuotata.")
+            if st.session_state.get("persist", True):
+                clear_memory()  # <- svuota anche il file data/memory_default.json
+            st.success("Chat svuotata" + (" (anche memoria salvata)" if st.session_state.get("persist", True) else "."))
     with c2:
         if st.button("🗑️ Cancella memoria salvata"):
             clear_memory()
@@ -684,6 +713,11 @@ user = st.chat_input("Scrivi qui…")
 if user:
     san_user = _sanitize_meta_and_noise(user)
 
+    # ── PATCH: se è un comando di "continua", NON salvarlo in history, attiva azione
+    if _is_continue_cmd(san_user):
+        st.session_state["do_continue"] = True
+        st.rerun()
+
     st.session_state.history.append({"role": "user", "content": san_user})
     log.info(f"USER: {san_user}")
 
@@ -691,6 +725,18 @@ if user:
         st.markdown(san_user)
 
     nlp_data = analyze_text(san_user)
+
+    # ── PATCH: applica override intent se presente per questo testo
+    try:
+        k = hashlib.sha1((san_user or "").strip().lower().encode("utf-8")).hexdigest()
+        ov = st.session_state["intent_overrides"].get(k)
+        if ov:
+            nlp_data["intent"] = ov
+            nlp_data["score"] = 0.99
+            nlp_data["override"] = True
+    except Exception:
+        pass
+
     with st.expander("🔎 NLP insight", expanded=False):
         st.write(nlp_data)
 
@@ -816,6 +862,10 @@ if user:
 st.divider()
 st.subheader("🖊️ Correzione intent dell’ultimo messaggio")
 
+# ── PATCH: helper per chiave override
+def _intent_key(text: str) -> str:
+    return hashlib.sha1((text or "").strip().lower().encode("utf-8")).hexdigest()
+
 corr_snapshot = {
     "text": "",
     "predicted_intent": "general",
@@ -850,4 +900,3 @@ if st.button("💾 Salva correzione intent"):
         st.rerun()  # refresh immediato dell'NLP insight
     else:
         st.warning("Nessun messaggio utente da correggere.")
-
