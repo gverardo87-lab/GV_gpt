@@ -52,6 +52,11 @@ from core.engine import (
     call_chat, stream_chat, call_chat_smart, build_continue_only_messages
 )
 from core.memory import load_memory, save_memory, clear_memory
+
+# Ripulisci memoria all'avvio se richiesto da env (utile in demo o dopo bug)
+if (os.getenv("GV_BOOT_CLEAR_MEMORY", "0").lower() in ("1","true","yes","on")):
+    clear_memory()
+
 from core.logger import get_logger
 log = get_logger()
 log.info(f"INIT: persist={st.session_state.get('persist', True)} "
@@ -125,6 +130,7 @@ def _strip_drift_lines(text: str) -> str:
 
 # ▶︎ PATCH 1: Sentinel di chiusura (coerente con Modelfile)
 OLLAMA_SENTINEL = "[[END_OF_OUTPUT]]"
+SENTINELS = ("[[END_OF_OUTPUT]]", "<<FINE>>")  # ← supporto multiplo
 
 # ==== Export helpers ==========================================================
 def export_chat_md(history: list) -> str:
@@ -494,6 +500,11 @@ else []
 # <- init sicuro
 st.session_state.setdefault("intent_overrides", {})     # ← PATCH: storage override intent
 
+# ← nuovo log “READY” dopo init history (non rimuovo il tuo log precedente)
+log.info(f"READY: persist={st.session_state.get('persist', True)} "
+         f"history_len={len(st.session_state.get('history', []))} "
+         f"engine={st.session_state.get('engine')}")
+
 with st.sidebar:
     st.header("⚙️ Aspetto")
     st.session_state["high_readability"] = st.toggle("Alta leggibilità", value=st.session_state["high_readability"])
@@ -669,42 +680,93 @@ def _update_outline_if_needed(full_text: str, every_round: int, round_idx: int, 
         log.warning(f"Outline update failed: {e}")
 
 # ---------- CONTINUE BUTTON ---------------------------------------------------
+# ---------- CONTINUE BUTTON ---------------------------------------------------
 if st.session_state.get("do_continue"):
     st.session_state.pop("do_continue", None)
-    last_user_text, last_assistant_text = _find_last_user_and_assistant(st.session_state.history)
+
+    hist = st.session_state.history
+    last_role = hist[-1]["role"] if hist else None
     engine_now = st.session_state.get("engine", "openai")
-    system_text = system_prompt_for_intent("general")
-    if engine_now == "ollama":
-        system_text += " Mantieni rigorosamente la lingua italiana per tutta la risposta; non passare a inglese o spagnolo. Se accade, correggiti e torna subito all'italiano."
+    reply = ""
 
-    san_last_user = _sanitize_meta_and_noise(last_user_text)
-    san_last_assistant = _sanitize_meta_and_noise(last_assistant_text)
-
-    with st.chat_message("assistant"):
-        t0 = time.time()
-        reply = ""
+    if last_role == "assistant":
+        # Branch A: prosegui l’ULTIMA RISPOSTA (comportamento classico)
+        last_user_text, last_assistant_text = _find_last_user_and_assistant(hist)
+        san_last_user = _sanitize_meta_and_noise(last_user_text)
+        nlp_last = analyze_text(san_last_user) if san_last_user else {"intent": "general"}
         try:
-            msgs = build_continue_only_messages(
-                system_once=system_text,
-                history=[{"role": "user", "content": san_last_user},
-                         {"role": "assistant", "content": san_last_assistant}],
-                final_text_tail=_tail(san_last_assistant, 3000),
-                round_words=800,
-                didactic=False,
-            )
-            chunk = call_chat_smart(msgs, temperature=0.7)  # non-stream per applicare guardie
-            chunk = _strip_drift_lines(_strip_drift_prefix(chunk))
-            if _looks_restart(chunk) or _is_reduant(chunk, san_last_assistant) or _too_similar(chunk, san_last_assistant):
-                chunk = re.sub(r'(?is)^.{0,300}\n', '', chunk, count=1).strip()
-            reply = (chunk or "").replace("<<FINE>>","").strip()
-            reply = post_format_response(reply)  # post-format finale
-            st.markdown(reply if reply else "_(nessun avanzamento)_")
-        except Exception as e:
-            reply = "⚠️ Errore (continua): " + str(e).split("\n")[0]
-            st.markdown(reply)
-        log.info(f"CONTINUE elapsed={time.time()-t0:.1f}s")
+            k = hashlib.sha1((san_last_user or "").strip().lower().encode("utf-8")).hexdigest()
+            ov = st.session_state["intent_overrides"].get(k)
+            if ov:
+                nlp_last["intent"] = ov
+                nlp_last["score"] = 0.99
+                nlp_last["override"] = True
+        except Exception:
+            pass
+        system_text = system_prompt_for_intent(nlp_last.get("intent", "general"))
+        if engine_now == "ollama":
+            system_text += " Mantieni rigorosamente la lingua italiana per tutta la risposta; non passare a inglese o spagnolo. Se accade, correggiti e torna subito all'italiano."
 
-    st.session_state.history.append({"role": "assistant", "content": reply})
+        san_last_user = _sanitize_meta_and_noise(last_user_text)
+        san_last_assistant = _sanitize_meta_and_noise(last_assistant_text)
+
+        with st.chat_message("assistant"):
+            t0 = time.time()
+            try:
+                msgs = build_continue_only_messages(
+                    system_once=system_text,
+                    history=[{"role": "user", "content": san_last_user},
+                             {"role": "assistant", "content": san_last_assistant}],
+                    final_text_tail=_tail(san_last_assistant, 3000),
+                    round_words=800,
+                    didactic=False,
+                )
+                chunk = call_chat_smart(msgs, temperature=0.7)
+                chunk = _strip_drift_lines(_strip_drift_prefix(chunk))
+                if _looks_restart(chunk) or _is_reduant(chunk, san_last_assistant) or _too_similar(chunk, san_last_assistant):
+                    import re
+                    chunk = re.sub(r'(?is)^.{0,300}\n', '', chunk, count=1).strip()
+                reply = (chunk or "").replace("<<FINE>>", "").strip()
+                reply = post_format_response(reply)
+                st.markdown(reply if reply else "_(nessun avanzamento)_")
+            except Exception as e:
+                reply = "⚠️ Errore (continua): " + str(e).split("\n")[0]
+                st.markdown(reply)
+            finally:
+                st.session_state["stop_generation"] = False  # ← reset sicuro SEMPRE
+            log.info(
+                f"ENGINE={engine_now} DIDACTIC={st.session_state.get('didactic', False)} ELAPSED={time.time() - t0:.1f}s")
+
+        st.session_state.history.append({"role": "assistant", "content": reply})
+
+    else:
+        # Branch B: l’ultimo messaggio è dell’utente → “continua” = approfondisci l’ULTIMA RICHIESTA
+        last_user = next((m["content"] for m in reversed(hist) if m.get("role") == "user"), "")
+        san_user = _sanitize_meta_and_noise(last_user)
+
+        if engine_now in ("openai", "hugging"):
+            nlp = analyze_text(san_user)
+            sys = system_prompt_for_intent(nlp.get("intent", "general"))
+            msgs = [
+                {"role": "system", "content": sys},
+                {"role": "user", "content": compose_prompt(san_user, nlp) + "\n\nApprofondisci e vai più a fondo. Evita premesse introduttive."}
+            ]
+        else:
+            # Ollama: prompt minimale per evitare conflitti col SYSTEM del Modelfile
+            msgs = [{"role": "user", "content": san_user + "\n\nApprofondisci e vai più a fondo. Evita premesse introduttive."}]
+
+        with st.chat_message("assistant"):
+            try:
+                reply = call_chat_smart(msgs, temperature=0.6)
+                reply = _strip_drift_lines(_strip_drift_prefix(reply))
+                reply = post_format_response(reply)
+                st.markdown(reply)
+            except Exception as e:
+                reply = f"⚠️ Errore (continua/approfondisci): {str(e).splitlines()[0]}"
+                st.markdown(reply)
+
+        st.session_state.history.append({"role": "assistant", "content": reply})
+
     if st.session_state.get("persist", True):
         save_memory(st.session_state.history)
 
@@ -792,10 +854,13 @@ if user:
                     pieces.append(delta)
                     joined = "".join(pieces)
 
-                    # Stop immediato su sentinel
-                    if OLLAMA_SENTINEL in joined:
-                        joined = joined.split(OLLAMA_SENTINEL, 1)[0]
-                        stopped_by_sentinel = True
+                    # Stop immediato su uno dei sentinel supportati
+                    if any(s in joined for s in SENTINELS):
+                        for s in SENTINELS:
+                            if s in joined:
+                                joined = joined.split(s, 1)[0]
+                                stopped_by_sentinel = True
+                                break
 
                     # Solo normalizzazione minima durante lo stream
                     light = re.sub(r"(?m)^\s*#{4,}\s*", "## ", joined)
@@ -805,8 +870,10 @@ if user:
                         break
 
                 reply = "".join(pieces)
-                if OLLAMA_SENTINEL in reply:
-                    reply = reply.split(OLLAMA_SENTINEL, 1)[0]
+                for s in SENTINELS:
+                    if s in reply:
+                        reply = reply.split(s, 1)[0]
+                        break
                 reply = reply.strip()
                 if not reply:
                     raise RuntimeError("Nessun testo dallo stream")
@@ -851,6 +918,8 @@ if user:
             else:
                 reply = f"⚠️ Errore modello: {str(e).splitlines()[0]}"
                 st.markdown(reply)
+        finally:
+            st.session_state["stop_generation"] = False  # ← reset sicuro SEMPRE
 
         log.info(f"ENGINE={engine_now} DIDACTIC={st.session_state.get('didactic', False)} ELAPSED={time.time()-t0:.1f}s")
 
