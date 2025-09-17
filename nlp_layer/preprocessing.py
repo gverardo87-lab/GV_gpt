@@ -53,6 +53,20 @@ def _guess_intent(user_input: str) -> Tuple[str, float]:
 # === Analisi NLP ===
 def analyze_text(user_input: str) -> Dict[str, Any]:
     intent, score = _guess_intent(user_input)
+    # --- META-PROMPT: forza l’intento se il testo parla esplicitamente di "prompt"
+    import os, re
+
+    META_RX = re.compile(
+        r"\b(meta[-\s]?prompt|system\s*prompt|prompt\s+ottimizz|ottimizz\w*\s+il\s+prompt|"
+        r"scrivimi\s+un\s+prompt|scrivi\s+un\s+prompt|prompt\s+per)\b",
+        re.IGNORECASE
+    )
+
+    # abilita/disabilita via env (ON di default)
+    if os.getenv("GV_META_PROMPT", "1").lower() in ("1", "true", "yes", "on"):
+        if META_RX.search(user_input or ""):
+            intent = "meta_prompt"
+            score = 0.97  # alto per evitare override downstream
 
     # Regex entities
     entities: List[Tuple[str, str]] = []

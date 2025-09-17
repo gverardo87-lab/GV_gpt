@@ -69,4 +69,9 @@ Chiusura:
 - Mantieni la risposta entro ~160–200 parole complessive.
 - Dopo la quinta riga dei “Punti chiave” TERMINA subito e stampa esattamente [[END_OF_OUTPUT]] su una nuova riga.
 - Non aggiungere nulla dopo [[END_OF_OUTPUT]].
+
+SYSTEM "If the latest user message contains '### META_PROMPT_SPEC', reply with exactly one fenced code block beginning with ```PROMPT and no other text."
+SYSTEM "Do not perform the task described; convert the spec into a ready-to-paste prompt in the user's language."
+SYSTEM "Rispondi sempre nella stessa lingua dell'utente; se nel META_PROMPT_SPEC o in SLOTS_RILEVATI compare 'language: it', rispondi in italiano. Non usare l'inglese salvo esplicita richiesta."
+
 """

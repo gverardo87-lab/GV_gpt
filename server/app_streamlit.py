@@ -890,6 +890,19 @@ if st.session_state.get("do_continue"):
     if st.session_state.get("persist", True):
         save_memory(st.session_state.history)
 
+# 7.9) Barra strumenti input — Toggle META
+with st.container():
+    c1, c2 = st.columns([1, 6], vertical_alignment="center")
+    with c1:
+        st.session_state.setdefault("meta_on", False)
+        st.session_state["meta_on"] = st.toggle(
+            "META",
+            value=st.session_state["meta_on"],
+            help="ON: restituisce un prompt ottimizzato (meta-GPT). OFF: risposta normale."
+        )
+    with c2:
+        st.caption("META ON: ti preparo il prompt ottimizzato da incollare in un altro GPT.")
+
 # 8) Input utente (turno normale)
 user = st.chat_input("Scrivi qui…")
 if user:
@@ -907,6 +920,11 @@ if user:
         st.markdown(san_user)
 
     nlp_data = get_nlp_cached(san_user, compute_if_missing=True)
+    # ── META: se ON, forziamo l’intent (senza toccare il classificatore)
+    if st.session_state.get("meta_on", False):
+        nlp_data["intent"] = "meta_prompt"
+        nlp_data["score"] = 0.99
+        nlp_data["override"] = True
 
     # ── PATCH: applica override intent se presente per questo testo
     try:
@@ -939,8 +957,11 @@ if user:
             {"role": "user", "content": compose_prompt(san_user, nlp_data) + didactic_suffix}
         ]
     else:
-        # OLLAMA: prompt minimale (evita conflitti con SYSTEM nel Modelfile)
-        base_messages = [{"role": "user", "content": san_user}]
+        # OLLAMA: se META → passiamo lo SPEC composto; altrimenti testo grezzo
+        if (nlp_data.get("intent", "").lower() == "meta_prompt"):
+            base_messages = [{"role": "user", "content": compose_prompt(san_user, nlp_data)}]
+        else:
+            base_messages = [{"role": "user", "content": san_user}]
 
     with st.chat_message("assistant"):
         t0 = time.time()
