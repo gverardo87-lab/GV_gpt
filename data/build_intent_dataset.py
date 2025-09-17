@@ -1,0 +1,685 @@
+# data/build_intent_dataset.py
+# Costruisce un dataset >=1000 esempi direttamente in data/intent_examples.json
+import json, random, re
+from pathlib import Path
+
+random.seed(42)
+
+ROOT = Path(__file__).resolve().parents[1]
+DATA = ROOT / "data"
+DATA.mkdir(parents=True, exist_ok=True)
+
+OUT_JSON = DATA / "intent_examples.json"  # SOT: unico dataset usato in runtime
+
+# =========  SEED (quelli che mi hai passato)  =========
+seed = {
+  "coding": [
+    "Voglio imparare Java dalle basi",
+    "Come si gestire eccezioni in TypeScript?",
+    "Come usare Git per definire una classe",
+    "Best practice per creare una funzione in JavaScript",
+    "Esempio pratico per fare una richiesta HTTP",
+    "Best practice per usare le regex in TypeScript",
+    "Come si fare una richiesta HTTP in JavaScript?",
+    "Esempio pratico per gestire eccezioni",
+    "Esempio pratico per definire una classe",
+    "Come si gestire eccezioni in C++?",
+    "Best practice per fare una richiesta HTTP in Python",
+    "Come si creare una funzione in Python?",
+    "Come si fare una richiesta HTTP in Java?",
+    "Best practice per definire una classe in Python",
+    "Esempio pratico per creare una funzione",
+    "Come si leggere un CSV con Pandas in Java?",
+    "Come strutturare un progetto JavaScript con venv e requirements",
+    "Mi spieghi la differenza tra decorator in Python?",
+    "Best practice per fare una richiesta HTTP in JavaScript",
+    "Regex in JavaScript per estrarre email",
+    "Regex in TypeScript per estrarre email",
+    "Come si creare una funzione in TypeScript?",
+    "Mi spieghi la differenza tra dizionari in C++?",
+    "Come si usare le regex in Python?",
+    "Come strutturare un progetto TypeScript con venv e requirements",
+    "Come risolvo NullPointerException in C++?",
+    "Mi spieghi la differenza tra OOP in Python?",
+    "Come si leggere un CSV con Pandas in Python?",
+    "Regex in Python per estrarre email",
+    "Mi spieghi la differenza tra OOP in JavaScript?",
+    "Puoi mostrarmi un esempio di fare una richiesta HTTP con commenti?",
+    "Come si parlare con un'API REST in TypeScript?",
+    "Come si parlare con un'API REST in Java?",
+    "Mi spieghi la differenza tra decorator in JavaScript?",
+    "Best practice per creare una funzione in Python",
+    "Mi spieghi la differenza tra dizionari in Java?",
+    "Puoi mostrarmi un esempio di gestire eccezioni con commenti?",
+    "Best practice per definire una classe in C++",
+    "Come risolvo bug intermittente in Java?",
+    "Mi spieghi la differenza tra OOP in TypeScript?",
+    "Mi spieghi la differenza tra generatori in C++?",
+    "Puoi mostrarmi un esempio di parlare con un'API REST con commenti?",
+    "mi puoi creare un minicorso di unix?",
+    "no gpt voglio imparare a sviluppare gpt esterni a open ai come te e farlo nel mio ambiente PyCharm, come posso inziare?"
+  ],
+  "business": [
+    "Come calcolare il AOV per un e-commerce",
+    "Mi aiuti a presentare un funnel di vendita?",
+    "Esempio di customer segmentation con template slide",
+    "Come migliorare il tasso di conversione per un e-commerce",
+    "Mi aiuti a presentare un customer segmentation?",
+    "Mi aiuti a presentare un business plan?",
+    "Come calcolare il CAC per un e-commerce",
+    "Come presentare il ROAS per un e-commerce",
+    "Esempio di analisi SWOT con template slide",
+    "Esempio di budget marketing con template dashboard",
+    "Come presentare il AOV per un e-commerce",
+    "Come presentare il churn per un e-commerce",
+    "Come presentare il tasso di conversione per un e-commerce",
+    "Come migliorare il churn per un e-commerce",
+    "Mi aiuti a calcolare un pricing di un SaaS?",
+    "Strategia di analisi SWOT: passi concreti",
+    "Esempio di funnel di vendita con template foglio Google",
+    "Come migliorare il CAC per un e-commerce",
+    "Come migliorare il AOV per un e-commerce",
+    "Come stimare il LTV e con quali dati?",
+    "Esempio di benchmark competitor con template report",
+    "Come presentare il margine di contribuzione per un e-commerce",
+    "Mi aiuti a impostare un business plan?",
+    "Mi aiuti a impostare un customer segmentation?",
+    "Mi aiuti a presentare un budget marketing?",
+    "Mi aiuti a migliorare un business plan?",
+    "Mi aiuti a migliorare un customer segmentation?",
+    "Strategia di budget marketing: passi concreti",
+    "Come impostare il ROAS per un e-commerce",
+    "Esempio di analisi SWOT con template report",
+    "Mi aiuti a monitorare un budget marketing?",
+    "Errori comuni nel forecast vendite e come evitarli",
+    "Esempio di analisi SWOT con template foglio Google",
+    "Esempio di benchmark competitor con template dashboard",
+    "Esempio di business plan con template slide",
+    "Come stimare il AOV e con quali dati?",
+    "Mi aiuti a presentare un pricing di un SaaS?",
+    "Scrivi la struttura di un forecast vendite convincente",
+    "Mi aiuti a monitorare un analisi SWOT?",
+    "Scrivi la struttura di un pricing di un SaaS convincente",
+    "Come migliorare il LTV per un e-commerce",
+    "Scrivi la struttura di un analisi SWOT convincente",
+    "ciao gpt per un capocantiere navale con un passato di 10 annida ufficiale 3 da supervisore metalmeccanico in Fincantieri Genova Sestri responsabile delle medie e grandi carpenterie di allestimento, secondo te dove potrei trovare migliori opportunita' in Europa? preferisco limi caldi se possibile ma ha la priorita' il miglilramento della vita rispetto all'Italia per me e per la mia famiglia e futuri figli"
+  ],
+  "nutrition": [
+    "Lista cena sane per ridurre il colesterolo LDL",
+    "Quante calorie per cena se voglio ridurre il colesterolo LDL?",
+    "Quante calorie per cena se voglio tenere bassa la glicemia?",
+    "Esempio settimanale di chetogenica per aumentare massa magra",
+    "Esempio settimanale di vegetariana per tenere bassa la glicemia",
+    "Esempio settimanale di dieta mediterranea per ridurre il colesterolo LDL",
+    "Esempio settimanale di chetogenica per tenere bassa la glicemia",
+    "Esempio settimanale di ipocalorica bilanciata per dimagrire",
+    "Quante calorie per cena se voglio aumentare massa magra?",
+    "Lista colazione sane per dimagrire",
+    "Pro e contro della dieta mediterranea",
+    "Esempio settimanale di dieta mediterranea per aumentare massa magra",
+    "Lista cena sane per dimagrire",
+    "Come combinare i macronutrienti durante colazione",
+    "Esempio settimanale di ipocalorica bilanciata per ridurre il colesterolo LDL",
+    "Come calcolare il metabolismo basale in modo semplice",
+    "Come calcolare il vitamina D in modo semplice",
+    "Quante calorie per spuntino se voglio tenere bassa la glicemia?",
+    "Quante calorie per cena se voglio dimagrire?",
+    "Quante calorie per pranzo se voglio aumentare massa magra?",
+    "Come calcolare il fabbisogno calorico in modo semplice",
+    "Cibi consigliati ricchi di vitamina D",
+    "Lista cena sane per aumentare massa magra",
+    "Esempio settimanale di vegetariana per aumentare massa magra",
+    "Lista colazione sane per tenere bassa la glicemia",
+    "Come calcolare il lattosio in modo semplice",
+    "Quante calorie per colazione se voglio aumentare massa magra?",
+    "Come calcolare il fibre in modo semplice",
+    "Come combinare i macronutrienti durante pranzo",
+    "Come combinare i macronutrienti durante spuntino",
+    "Esempio settimanale di dieta mediterranea per tenere bassa la glicemia",
+    "Lista spuntino sane per ridurre il colesterolo LDL",
+    "Lista colazione sane per aumentare massa magra",
+    "Lista pranzo sane per tenere bassa la glicemia",
+    "Pro e contro della vegetariana",
+    "Cibi consigliati ricchi di metabolismo basale",
+    "Lista cena sane per tenere bassa la glicemia",
+    "Come combinare i macronutrienti durante pranzo",
+    "Quante calorie per colazione se voglio tenere bassa la glicemia?",
+    "Lista pranzo sane per aumentare massa magra"
+  ],
+  "calendar": [
+    "mostra la disponibilità con il commercialista giovedì verso le 11",
+    "Che impegni ho domani alle 10:30?",
+    "fissa una riunione con il team domani tra le 14 e le 16",
+    "Promemoria per chiamare il commercialista domani verso le 11",
+    "Invia un invito a il commercialista per lunedì prossimo tra le 14 e le 16",
+    "mostra la disponibilità con il fornitore venerdì verso le 11",
+    "mostra la disponibilità con il commercialista lunedì prossimo dalle 15 alle 17",
+    "crea un invito con link Zoom con Giulia giovedì dalle 15 alle 17",
+    "mostra la disponibilità con il fornitore domani verso le 11",
+    "imposta un promemoria con Giulia oggi alle 9",
+    "sposta l'appuntamento con il fornitore giovedì tra le 14 e le 16",
+    "mostra la disponibilità con il fornitore venerdì alle 10:30",
+    "Invia un invito a Marco per lunedì prossimo tra le 14 e le 16",
+    "Invia un invito a Giulia per venerdì tra le 14 e le 16",
+    "imposta un promemoria con il commercialista giovedì verso le 11",
+    "sposta l'appuntamento con il commercialista lunedì prossimo tra le 14 e le 16",
+    "Promemoria per chiamare il fornitore lunedì prossimo tra le 14 e le 16",
+    "sposta l'appuntamento con il fornitore giovedì verso le 11",
+    "Invia un invito a il commercialista per domani alle 9",
+    "fissa una riunione con il team domani alle 9",
+    "Invia un invito a il fornitore per lunedì prossimo tra le 14 e le 16",
+    "sposta l'appuntamento con il team oggi alle 10:30",
+    "fissa una riunione con Marco venerdì alle 9",
+    "fissa una riunione con il team venerdì alle 10:30",
+    "imposta un promemoria con il fornitore oggi dalle 15 alle 17",
+    "Promemoria per chiamare il team lunedì prossimo verso le 11",
+    "Invia un invito a Giulia per oggi alle 10:30",
+    "mostra la disponibilità con il team domani alle 10:30",
+    "imposta un promemoria con il fornitore domani alle 9",
+    "sposta l'appuntamento con il team giovedì tra le 14 e le 16",
+    "crea un invito con link Zoom con Giulia oggi alle 9",
+    "Promemoria per chiamare Giulia venerdì dalle 15 alle 17",
+    "Promemoria per chiamare il commercialista lunedì prossimo verso le 11",
+    "mostra la disponibilità con il team giovedì tra le 14 e le 16",
+    "fissa una riunione con il fornitore oggi verso le 11",
+    "sposta l'appuntamento con Giulia lunedì prossimo tra le 14 e le 16",
+    "Invia un invito a il fornitore per lunedì prossimo alle 9",
+    "sposta l'appuntamento con il fornitore domani dalle 15 alle 17"
+  ],
+  "study": [
+    "Devo preparare microeconomia: flashcard in 2 settimane",
+    "Come organizzare un flashcard efficace per microeconomia",
+    "Come organizzare un riassunto efficace per statistica",
+    "Genera esercizi con soluzione su metodo di studio",
+    "Genera flashcard su limiti notevoli",
+    "Devo preparare microeconomia: flashcard in 10 giorni",
+    "Domande tipiche d'esame per fisica con risposte",
+    "Devo preparare analisi 1: flashcard in 10 giorni",
+    "Come organizzare un piano di studio efficace per fisica",
+    "Come organizzare un riassunto efficace per fisica",
+    "Devo preparare microeconomia: flashcard per 1 mese",
+    "Devo preparare microeconomia: esercizi con soluzione in 10 giorni",
+    "Genera riassunto su limiti notevoli",
+    "Spiegami i tecniche di memoria con esempi",
+    "Devo preparare analisi 1: piano di studio per 1 mese",
+    "Devo preparare fisica: riassunto per 1 mese",
+    "Come evitare la procrastinazione nello studio",
+    "Devo preparare statistica: riassunto in 2 settimane",
+    "Genera riassunto su derivate",
+    "Come organizzare un riassunto efficace per microeconomia",
+    "Applica il metodo Pomodoro per analisi 1",
+    "Devo preparare fisica: riassunto in 10 giorni",
+    "Spiegami i limiti notevoli con esempi",
+    "Devo preparare microeconomia: riassunto in 2 settimane",
+    "Devo preparare fisica: piano di studio in 2 settimane",
+    "Devo preparare diritto privato: riassunto per 1 mese",
+    "Genera esercizi con soluzione su derivate",
+    "Come organizzare un esercizi con soluzione efficace per microeconomia",
+    "Come organizzare un flashcard efficace per analisi 1",
+    "Devo preparare microeconomia: riassunto in 10 giorni",
+    "Devo preparare microeconomia: esercizi con soluzione per 1 mese",
+    "Genera piano di studio su integrazione",
+    "Genera flashcard su integrazione",
+    "Devo preparare diritto privato: esercizi con soluzione in 10 giorni",
+    "Devo preparare fisica: piano di studio in 10 giorni",
+    "Devo preparare diritto privato: flashcard per 1 mese",
+    "Applica il metodo Pomodoro per fisica",
+    "Domande tipiche d'esame per diritto privato con risposte",
+    "Spiegami i derivate con esempi",
+    "Devo preparare diritto privato: piano di studio in 2 settimane",
+    "Come organizzare un piano di studio efficace per microeconomia",
+    "Come organizzare un flashcard efficace per fisica",
+    "Vorrei un piano di 4 settimane per imparare il francese da zero con esercizi giornalieri.",
+    "puoi aiutarmi a imparare a suona re la batteria?",
+    "parlami della storia di genova"
+  ],
+  "health": [
+    "Cosa fare in caso di reflusso?",
+    "Quando fare esami del sangue per pressione arteriosa?",
+    "insonnia: rimedi possibili",
+    "Dieta per colesterolo alto",
+    "Linee guida generali su vaccino antinfluenzale (non è un consulto medico)",
+    "tachicardia: quando preoccuparsi",
+    "Cosa fare in caso di mal di testa persistente?",
+    "reflusso: sintomi",
+    "influenza: sintomi",
+    "Linee guida generali su visita dal medico di base (non è un consulto medico)",
+    "allergia stagionale: sintomi",
+    "mal di testa persistente: quando preoccuparsi",
+    "insonnia: sintomi",
+    "Dieta per pressione arteriosa",
+    "influenza: quando preoccuparsi",
+    "Cosa fare in caso di insonnia?",
+    "allergia stagionale: quando preoccuparsi",
+    "Linee guida generali su diabete di tipo 2 (non è un consulto medico)",
+    "allergia stagionale: stile di vita utile",
+    "influenza: rimedi possibili",
+    "reflusso: stile di vita utile",
+    "Linee guida generali su pressione arteriosa (non è un consulto medico)",
+    "mal di testa persistente: sintomi",
+    "tachicardia: stile di vita utile",
+    "tachicardia: sintomi",
+    "Dieta per ibuprofene effetti collaterali",
+    "Quando fare esami del sangue per colesterolo alto?",
+    "Quando fare esami del sangue per vaccino antinfluenzale?",
+    "tachicardia: rimedi possibili",
+    "influenza: stile di vita utile",
+    "insonnia: stile di vita utile",
+    "Quando fare esami del sangue per ibuprofene effetti collaterali?",
+    "Valori normali della colesterolo alto",
+    "Linee guida generali su colesterolo alto (non è un consulto medico)",
+    "insonnia: quando preoccuparsi",
+    "Valori normali della diabete di tipo 2",
+    "reflusso: rimedi possibili",
+    "Valori normali della ibuprofene effetti collaterali",
+    "Cosa fare in caso di allergia stagionale?",
+    "reflusso: quando preoccuparsi"
+  ],
+  "motivation": [
+    "Strategie per superare procrastinazione",
+    "Piano settimanale per alzarmi presto con SMART goals",
+    "Piano settimanale per allenarmi 3 volte a settimana con visualizzazione",
+    "Strategie per superare focus mentale",
+    "Piano settimanale per leggere 30 minuti al giorno con visualizzazione",
+    "Non ho motivazione a scrivere tutti i giorni: consigli pratici",
+    "Strategie per superare abitudini",
+    "Non ho motivazione a allenarmi 3 volte a settimana: consigli pratici",
+    "Piano settimanale per scrivere tutti i giorni con tecnica Pomodoro",
+    "Come creare e mantenere paura del fallimento efficaci",
+    "Piano settimanale per studiare con costanza con habit stacking",
+    "Strategie per superare produttività",
+    "Piano settimanale per studiare con costanza con tecnica Pomodoro",
+    "Come creare e mantenere procrastinazione efficaci",
+    "Non ho motivazione a leggere 30 minuti al giorno: consigli pratici",
+    "Come creare e mantenere abitudini efficaci",
+    "Piano settimanale per alzarmi presto con habit stacking",
+    "Piano settimanale per leggere 30 minuti al giorno con tecnica Pomodoro",
+    "Non ho motivazione a studiare con costanza: consigli pratici",
+    "Piano settimanale per leggere 30 minuti al giorno con habit stacking",
+    "Piano settimanale per allenarmi 3 volte a settimana con tecnica Pomodoro",
+    "Routine mattutina per migliorare disciplina",
+    "Routine mattutina per migliorare focus mentale",
+    "Piano settimanale per scrivere tutti i giorni con visualizzazione",
+    "Strategie per superare autostima",
+    "Piano settimanale per alzarmi presto con visualizzazione",
+    "Come creare e mantenere focus mentale efficaci",
+    "Routine mattutina per migliorare autostima",
+    "Come creare e mantenere disciplina efficaci",
+    "Piano settimanale per alzarmi presto con tecnica Pomodoro",
+    "Routine mattutina per migliorare paura del fallimento",
+    "Piano settimanale per allenarmi 3 volte a settimana con habit stacking",
+    "Routine mattutina per migliorare produttività",
+    "Routine mattutina per migliorare abitudini",
+    "Piano settimanale per studiare con costanza con SMART goals",
+    "Piano settimanale per leggere 30 minuti al giorno con SMART goals",
+    "Come creare e mantenere autostima efficaci",
+    "Piano settimanale per studiare con costanza con visualizzazione",
+    "Frasi motivazionali per iniziare la giornata",
+    "Strategie per superare disciplina"
+  ],
+  "finance": [
+    "Pro e contro di tassazione capital gain in Italia",
+    "Come impostare un tassazione capital gain in Italia orizzonte 20 anni profilo prudente",
+    "Come impostare un conto deposito orizzonte 10 anni profilo bilanciato",
+    "Come impostare un piano di accumulo (PAC) orizzonte 20 anni profilo prudente",
+    "Come impostare un piano pensionistico integrativo orizzonte 10 anni profilo prudente",
+    "Come impostare un conto deposito orizzonte 20 anni profilo prudente",
+    "Come impostare un piano pensionistico integrativo orizzonte 20 anni profilo prudente",
+    "Come impostare un interesse composto orizzonte 10 anni profilo prudente",
+    "Quando ha senso fondi indicizzati?",
+    "Come impostare un piano pensionistico integrativo orizzonte 5 anni profilo bilanciato",
+    "Come impostare un piano pensionistico integrativo orizzonte 5 anni profilo prudente",
+    "Come impostare un tassazione capital gain in Italia orizzonte 20 anni profilo bilanciato",
+    "Spiegami proteggersi dall'inflazione con esempi numerici",
+    "Come impostare un piano di accumulo (PAC) orizzonte 20 anni profilo dinamico",
+    "Come impostare un proteggersi dall'inflazione orizzonte 10 anni profilo prudente",
+    "Come impostare un proteggersi dall'inflazione o rizzonte 5 anni profilo bilanciato",
+    "Pro e contro di proteggersi dall'inflazione",
+    "Come impostare un interesse composto orizzonte 10 anni profilo dinamico",
+    "Come impostare un fondi indicizzati orizzonte 10 anni profilo dinamico",
+    "Come impostare un piano di accumulo (PAC) orizzonte 5 anni profilo prudente",
+    "Come impostare un fondi indicizzati orizzonte 20 anni profilo prudente",
+    "Spiegami tassazione capital gain in Italia con esempi numerici",
+    "Come impostare un conto deposito orizzonte 5 anni profilo bilanciato",
+    "Come impostare un piano di accumulo (PAC) orizzonte 10 anni profilo prudente",
+    "Come impostare un interesse composto orizzonte 20 anni profilo dinamico",
+    "Come impostare un piano pensionistico integrativo orizzonte 10 anni profilo dinamico",
+    "Come impostare un tassazione capital gain in Italia orizzonte 10 anni profilo dinamico",
+    "Simula un ETF a lungo termine partendo da 200€/mese",
+    "Come impostare un proteggersi dall'inflazione orizzonte 20 anni profilo prudente",
+    "Pro e contro di piano di accumulo (PAC)",
+    "Come impostare un tassazione capital gain in Italia orizzonte 5 anni profilo bilanciato",
+    "Come impostare un proteggersi dall'inflazione orizzonte 5 anni profilo dinamico",
+    "Come impostare un ETF a lungo termine orizzonte 5 anni profilo bilanciato",
+    "Come impostare un tassazione capital gain in Italia orizzonte 5 anni profilo prudente",
+    "Come impostare un ETF a lungo termine orizzonte 5 anni profilo dinamico",
+    "Come impostare un fondi indicizzati orizzonte 20 anni profilo bilanciato",
+    "Come impostare un ETF a lungo termine orizzonte 10 anni profilo bilanciato",
+    "Come impostare un interesse composto orizzonte 10 anni profilo bilanciato",
+    "Come impostare un proteggersi dall'inflazione orizzonte 20 anni profilo dinamico",
+    "Come impostare un proteggersi dall'inflazione orizzonte 10 anni profilo dinamico",
+    "Come impostare un piano pensionistico integrativo orizzonte 20 anni profilo dinamico",
+    "Spiegami piano di accumulo (PAC) con esempi numerici"
+  ],
+  "science": [
+    "differenza tra declinazione magnetica",
+    "spiegami nord magnetico vs geografico",
+    "perché dinamo terrestre",
+    "Esempi pratici per comprendere aurora boreale",
+    "Esperimento casalingo per osservare declinazione magnetica",
+    "perché campo magnetico terrestre",
+    "differenza tra nord magnetico vs geografico",
+    "spiegami campo magnetico terrestre",
+    "differenza tra tempeste geomagnetiche",
+    "come funziona tempeste geomagnetiche",
+    "Esempi pratici per comprendere declinazione magnetica",
+    "Esperimento casalingo per osservare nord magnetico vs geografico",
+    "Applicazioni quotidiane legate a linee di forza",
+    "spiegami bussola",
+    "Esperimento casalingo per osservare aurora boreale",
+    "Applicazioni quotidiane legate a dinamo terrestre",
+    "come funziona bussola",
+    "Applicazioni quotidiane legate a campo magnetico terrestre",
+    "Applicazioni quotidiane legate a tempeste geomagnetiche",
+    "Esempi pratici per comprendere tempeste geomagnetiche",
+    "Applicazioni quotidiane legate a declinazione magnetica",
+    "come funziona declinazione magnetica",
+    "Applicazioni quotidiane legate a nord magnetico vs geografico",
+    "Esempi pratici per comprendere dinamo terrestre",
+    "differenza tra aurora boreale",
+    "differenza tra dinamo terrestre",
+    "spiegami dinamo terrestre",
+    "spiegami declinazione magnetica",
+    "come funziona aurora boreale",
+    "differenza tra linee di forza",
+    "differenza tra campo magnetico terrestre",
+    "Esempi pratici per comprendere nord magnetico vs geografico",
+    "perché nord magnetico vs geografico",
+    "Esperimento casalingo per osservare bussola",
+    "come funziona campo magnetico terrestre",
+    "Esempi pratici per comprendere linee di forza",
+    "spiegami linee di forza",
+    "perché tempeste geomagnetiche",
+    "come si fa un piano di carico di una nave container?"
+  ],
+  "general": [
+    "Ciao, cosa puoi fare per me?",
+    "Mi spieghi come funziona questo assistente?",
+    "Raccontami qualcosa di interessante",
+    "Ho bisogno di aiuto ma non so da dove cominciare",
+    "Puoi ripetere?",
+    "Grazie mille!",
+    "Buongiorno, da dove partiamo?",
+    "Non ho capito l'ultima parte",
+    "Puoi fare un riepilogo?",
+    "Puoi farmi una domanda tu per capire meglio?",
+    "In cosa sei particolarmente bravo?",
+    "Come posso usare questo strumento al meglio?",
+    "Dammi qualche esempio di cosa sai fare",
+    "Aiutami a mettere ordine nelle idee",
+    "Non sono sicuro di cosa cercare",
+    "Vorrei solo chiacchierare un po'",
+    "Quali sono i tuoi limiti?",
+    "Puoi adattarti al mio stile?",
+    "Che differenza c'è tra te e un motore di ricerca?",
+    "Ok, procediamo",
+    "Domani vorrei fare una gita di un giorno vicino Genova, vista mare: 2 opzioni con percorso, costi indicativi e dove pranzare"
+  ]
+}
+
+# =========  Augment helpers  =========
+def dedup_list(items):
+    seen = set(); out = []
+    for s in items:
+        k = re.sub(r"\s+", " ", (s or "").strip().lower())
+        if k and k not in seen:
+            out.append((s or "").strip()); seen.add(k)
+    return out
+
+def mix_typos(text):
+    t = text
+    if random.random() < 0.15 and t:
+        t = t[0].lower() + t[1:]
+    if random.random() < 0.10:
+        t = t.replace("à","a'").replace("è","e'").replace("é","e'").replace("ì","i'").replace("ò","o'").replace("ù","u'")
+    if random.random() < 0.08:
+        t += random.choice([" 🙂"," 🙌"," 💡"])
+    return t
+
+# =========  Generatori per classe  =========
+def gen_coding(n=170):
+    langs = ["Python","JavaScript","TypeScript","Java","C++","Go","Rust"]
+    topics = [
+        "richiesta HTTP","regex per estrarre email","gestione eccezioni","OOP: classi e oggetti",
+        "lettura CSV con pandas","decorator","ambienti virtuali e dipendenze","API REST client",
+        "logging strutturato","CLI con argparse","Dockerfile per FastAPI"
+    ]
+    frames = [
+        "Best practice per {topic} in {lang}",
+        "Come si fa {topic} in {lang}?",
+        "Esempio pratico di {topic} in {lang}",
+        "Puoi mostrarmi uno snippet per {topic} in {lang}?",
+        "Mi spieghi {topic} passo per passo in {lang}?"
+    ]
+    add = []
+    for lang in langs:
+        for topic in topics:
+            for fr in frames:
+                add.append(fr.format(topic=topic, lang=lang))
+    add += [f"Guida rapida: struttura progetto {lang} con test e CI" for lang in langs]
+    random.shuffle(add)
+    return [mix_typos(s) for s in add][:n]
+
+def gen_business(n=150):
+    metrics = ["AOV","CAC","LTV","ROAS","churn","margine di contribuzione"]
+    frames = [
+        "Come calcolare {m} per un e-commerce",
+        "Come migliorare il {m} per un e-commerce",
+        "Come presentare il {m} in una slide chiara",
+        "Esempio di dashboard per monitorare {m}"
+    ]
+    add = []
+    for m in metrics:
+        for fr in frames:
+            add.append(fr.format(m=m))
+    add += [
+        "Esempio di analisi SWOT con template",
+        "Scrivi la struttura di un business plan convincente",
+        "Piano trimestrale marketing con budget e KPI",
+        "Benchmark competitor con tabella comparativa",
+        "Template email di follow-up commerciale"
+    ]
+    random.shuffle(add)
+    return [mix_typos(s) for s in add][:n]
+
+def gen_nutrition(n=120):
+    diets = ["chetogenica","ipocalorica bilanciata","mediterranea","vegetariana","low-carb"]
+    meals = ["colazione","pranzo","cena","spuntino"]
+    goals = ["dimagrire","aumentare massa magra","tenere bassa la glicemia","ridurre il colesterolo LDL"]
+    add = []
+    for diet in diets:
+        for goal in goals:
+            add.append(f"Esempio settimanale di dieta {diet} per {goal}")
+    for meal in meals:
+        for goal in goals:
+            add += [
+                f"Lista {meal} sane per {goal}",
+                f"Quante calorie per {meal} se voglio {goal}?",
+                f"Come combinare i macronutrienti durante {meal}"
+            ]
+    add += [
+        "Pro e contro della dieta mediterranea",
+        "Adattare i pasti per intolleranza al lattosio",
+        "Schema pasti batch cooking per settimana lavorativa"
+    ]
+    random.shuffle(add)
+    return [mix_typos(s) for s in add][:n]
+
+def gen_calendar(n=120):
+    people = ["Giulia","Marco","Sara","Luca","il commercialista","il fornitore","il team"]
+    days = ["oggi","domani","lunedì","martedì","mercoledì","giovedì","venerdì"]
+    times = ["alle 9","alle 10:30","verso le 11","tra le 14 e le 16","dalle 15 alle 17"]
+    frames = [
+        "mostra la disponibilità con {who} {day} {time}",
+        "fissa una riunione con {who} {day} {time}",
+        "sposta l'appuntamento con {who} {day} {time}",
+        "imposta un promemoria con {who} {day} {time}",
+        "crea un invito con link Zoom con {who} {day} {time}",
+        "Invia un invito a {who} {day} {time}",
+        "Che impegni ho {day} {time}?"
+    ]
+    add = []
+    for who in people:
+        for day in days:
+            for time in times:
+                fr = random.choice(frames)
+                add.append(fr.format(who=who, day=day, time=time))
+    random.shuffle(add)
+    return [mix_typos(s) for s in add][:n]
+
+def gen_study(n=150):
+    subjects = ["microeconomia","analisi 1","fisica","statistica","diritto privato","biologia"]
+    artifacts = ["flashcard","riassunto","piano di studio","quiz","esercizi con soluzione"]
+    horizons = ["in 10 giorni","in 2 settimane","per 1 mese"]
+    topics = ["limiti notevoli","derivate","integrazione","tecniche di memoria"]
+    add = []
+    for subj in subjects:
+        for art in artifacts:
+            for h in horizons:
+                add += [
+                    f"Devo preparare {subj}: {art} {h}",
+                    f"Come organizzare un {art} efficace per {subj}"
+                ]
+        add.append(f"Applica il metodo Pomodoro per {subj}")
+    for t in topics:
+        for art in artifacts:
+            add.append(f"Genera {art} su {t}")
+    add += [
+        "Vorrei un piano di 4 settimane per imparare il francese da zero con esercizi giornalieri.",
+        "Puoi aiutarmi a imparare a suonare la batteria?",
+        "Parlami della storia di Genova"
+    ]
+    random.shuffle(add)
+    return [mix_typos(s) for s in add][:n]
+
+def gen_health(n=120):
+    topics = ["reflusso","insonnia","mal di testa persistente","allergia stagionale","influenza","pressione arteriosa","colesterolo alto","diabete di tipo 2","tachicardia"]
+    frames = [
+        "Cosa fare in caso di {t}?",
+        "{t}: sintomi",
+        "{t}: quando preoccuparsi",
+        "{t}: rimedi possibili",
+        "{t}: stile di vita utile",
+        "Linee guida generali su {t} (non è un consulto medico)"
+    ]
+    add = []
+    for t in topics:
+        for fr in frames:
+            add.append(fr.format(t=t))
+    random.shuffle(add)
+    return [mix_typos(s) for s in add][:n]
+
+def gen_motivation(n=120):
+    targets = ["alzarmi presto","allenarmi 3 volte a settimana","leggere 30 minuti al giorno","scrivere tutti i giorni","studiare con costanza","migliorare la produttività"]
+    methods = ["tecnica Pomodoro","visualizzazione","habit stacking","SMART goals","journal"]
+    attrs = ["disciplina","focus mentale","autostima","paura del fallimento","abitudini","procrastinazione","produttività"]
+    add = []
+    for target in targets:
+        for method in methods:
+            add += [
+                f"Piano settimanale per {target} con {method}",
+                f"Non ho motivazione a {target}: consigli pratici"
+            ]
+    for a in attrs:
+        add += [f"Routine mattutina per migliorare {a}", f"Strategie per superare {a}"]
+    random.shuffle(add)
+    return [mix_typos(s) for s in add][:n]
+
+def gen_finance(n=120):
+    horizons = ["5 anni","10 anni","20 anni"]
+    profiles = ["prudente","bilanciato","dinamico"]
+    topics = [
+        "piano di accumulo (PAC)","ETF a lungo termine","conto deposito",
+        "fondi indicizzati","interesse composto","proteggersi dall'inflazione",
+        "tassazione capital gain in Italia","piano pensionistico integrativo"
+    ]
+    add = []
+    for t in topics:
+        for h in horizons:
+            for p in profiles:
+                add.append(f"Come impostare un {t} orizzonte {h} profilo {p}")
+        add += [f"Pro e contro di {t}", f"Spiegami {t} con esempi numerici", f"Quando ha senso {t}?"]
+    add.append("Simula un ETF a lungo termine partendo da 200€/mese")
+    random.shuffle(add)
+    return [mix_typos(s) for s in add][:n]
+
+def gen_science(n=120):
+    phenomena = ["declinazione magnetica","nord magnetico vs geografico","dinamo terrestre","campo magnetico terrestre","aurora boreale","linee di forza","tempeste geomagnetiche"]
+    frames = [
+        "spiegami {p}","come funziona {p}","perché {p}",
+        "Esempi pratici per comprendere {p}",
+        "Esperimento casalingo per osservare {p}",
+        "Applicazioni quotidiane legate a {p}",
+        "differenza tra {p}"
+    ]
+    add = []
+    for p in phenomena:
+        for fr in frames:
+            add.append(fr.format(p=p))
+    add.append("come si fa un piano di carico di una nave container?")
+    random.shuffle(add)
+    return [mix_typos(s) for s in add][:n]
+
+def gen_general(n=80):
+    base = [
+        "Ciao, cosa puoi fare per me?","Mi spieghi come funziona questo assistente?","Raccontami qualcosa di interessante",
+        "Ho bisogno di aiuto ma non so da dove cominciare","Puoi ripetere?","Grazie mille!","Buongiorno, da dove partiamo?",
+        "Non ho capito l'ultima parte","Puoi fare un riepilogo?","Puoi farmi una domanda tu per capire meglio?",
+        "In cosa sei particolarmente bravo?","Come posso usare questo strumento al meglio?","Dammi qualche esempio di cosa sai fare",
+        "Aiutami a mettere ordine nelle idee","Non sono sicuro di cosa cercare","Vorrei solo chiacchierare un po'","Quali sono i tuoi limiti?",
+        "Puoi adattarti al mio stile?","Che differenza c'è tra te e un motore di ricerca?","Ok, procediamo",
+        "Domani vorrei fare una gita di un giorno vicino Genova, vista mare: 2 opzioni con percorso, costi indicativi e dove pranzare"
+    ]
+    openers = ["Ciao","Ehi","Buongiorno","Buonasera","Hey"]
+    requests = ["Mi aiuti a partire?","Puoi guidarmi tu?","Da dove conviene iniziare?","Hai dei suggerimenti rapidi?"]
+    more = [f"{o}, {r}" for o in openers for r in requests]
+    all_items = base + more
+    random.shuffle(all_items)
+    return [mix_typos(s) for s in all_items][:n]
+
+TARGETS = {
+    "coding": 170, "business": 150, "nutrition": 120, "calendar": 120, "study": 150,
+    "health": 120, "motivation": 120, "finance": 120, "science": 120, "general": 80
+}
+
+GENERATORS = {
+    "coding": gen_coding, "business": gen_business, "nutrition": gen_nutrition, "calendar": gen_calendar,
+    "study": gen_study, "health": gen_health, "motivation": gen_motivation, "finance": gen_finance,
+    "science": gen_science, "general": gen_general
+}
+
+def build_dataset():
+    dataset = {k: dedup_list(v) for k, v in seed.items()}
+    for intent, target in TARGETS.items():
+        aug = GENERATORS[intent](n=target * 2)  # over-genera, poi dedup
+        merged = dedup_list(dataset.get(intent, []) + aug)
+        if len(merged) < target:
+            while len(merged) < target:
+                merged.append(mix_typos(random.choice(aug)))
+                merged = dedup_list(merged)
+        else:
+            merged = merged[:target]
+        dataset[intent] = merged
+    return dataset
+
+def main():
+    ds = build_dataset()
+    OUT_JSON.write_text(json.dumps(ds, ensure_ascii=False, indent=2), encoding="utf-8")
+    total = sum(len(v) for v in ds.values())
+    print("✔ intent_examples.json scritto.")
+    print("Intent:", len(ds), " | Totale esempi:", total)
+    for k in sorted(ds.keys()):
+        print(f"  - {k}: {len(ds[k])}")
+
+if __name__ == "__main__":
+    main()

@@ -1,13 +1,14 @@
 # nlp_layer/preprocessing.py — NLP con continuous learning
+
+import os
 import re
 import json
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, Any, List, Tuple
 
 import joblib
 from sentence_transformers import SentenceTransformer
-from sklearn.linear_model import LogisticRegression
 
 # === Percorsi ===
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,7 +37,9 @@ def load_model():
     return None
 
 _MODEL = load_model()
-_INTENTS = list(load_examples().keys())
+# Se il modello esiste, usa le sue classi; altrimenti fallback alle chiavi del dataset
+_INTENTS = list(getattr(_MODEL, "classes_", [])) or list(load_examples().keys())
+
 
 def _embed(texts: List[str]):
     return _EMB_MODEL.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
@@ -53,20 +56,6 @@ def _guess_intent(user_input: str) -> Tuple[str, float]:
 # === Analisi NLP ===
 def analyze_text(user_input: str) -> Dict[str, Any]:
     intent, score = _guess_intent(user_input)
-    # --- META-PROMPT: forza l’intento se il testo parla esplicitamente di "prompt"
-    import os, re
-
-    META_RX = re.compile(
-        r"\b(meta[-\s]?prompt|system\s*prompt|prompt\s+ottimizz|ottimizz\w*\s+il\s+prompt|"
-        r"scrivimi\s+un\s+prompt|scrivi\s+un\s+prompt|prompt\s+per)\b",
-        re.IGNORECASE
-    )
-
-    # abilita/disabilita via env (ON di default)
-    if os.getenv("GV_META_PROMPT", "1").lower() in ("1", "true", "yes", "on"):
-        if META_RX.search(user_input or ""):
-            intent = "meta_prompt"
-            score = 0.97  # alto per evitare override downstream
 
     # Regex entities
     entities: List[Tuple[str, str]] = []
@@ -75,12 +64,20 @@ def analyze_text(user_input: str) -> Dict[str, Any]:
     if re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", user_input):
         entities.append(("EMAIL", "CONTACT"))
 
+    # normalizza score in [0,1] e forza tipi sicuri
+    try:
+        _s = float(score or 0.0)
+    except Exception:
+        _s = 0.0
+    if _s < 0.0: _s = 0.0
+    if _s > 1.0: _s = 1.0
+
     result = {
         "text": user_input,
-        "intent": intent,
-        "score": round(score, 3),
+        "intent": str(intent or "general"),
+        "score": round(_s, 3),
         "entities": entities,
-        "tokens": user_input.split(),
+        "tokens": (user_input or "").split(),
     }
 
     # Log automatico
