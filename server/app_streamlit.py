@@ -68,7 +68,48 @@ try:
 except Exception:
     def analyze_text(txt: str):
         return {"intent": "general", "entities": [], "lang": "it"}
+# ==== NLP de-dup cache (evita doppi log) =====================================
+st.session_state.setdefault("nlp_cache", {})   # key -> nlp dict
+st.session_state.setdefault("nlp_seen", set()) # set di key già analizzate
 
+def _text_key(text: str) -> str:
+    return hashlib.sha1((text or "").strip().lower().encode("utf-8")).hexdigest()
+
+def get_nlp_cached(text: str, compute_if_missing: bool = True) -> dict | None:
+    """
+    Restituisce l'analisi NLP dalla cache; opzionalmente calcola e memorizza.
+    Nota: chiamare analyze_text qui può scrivere nel log; per evitare doppi log
+    usa compute_if_missing=False nei percorsi di 'continua' e del pannello.
+    """
+    k = _text_key(text)
+    cached = st.session_state["nlp_cache"].get(k)
+    if cached is not None:
+        return cached
+    if not compute_if_missing:
+        return None
+    nlp = analyze_text(text)
+    st.session_state["nlp_cache"][k] = nlp or {}
+    st.session_state["nlp_seen"].add(k)
+    return nlp
+
+# Path log NLP per eventuali correzioni manuali
+NLP_LOG_PATH = (ROOT / "data" / "nlp_logs.jsonl")
+
+def _append_nlp_correction_log(*, text: str, predicted_intent: str, predicted_score: float, corrected_intent: str) -> None:
+    row = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "type": "correction",
+        "text": text,
+        "hash": _text_key(text),
+        "intent_original": predicted_intent,
+        "score_original": predicted_score,
+        "intent": corrected_intent,       # campo usato per il training
+        "label": corrected_intent,        # compat: alcuni script cercano 'label'
+        "source": "ui"
+    }
+    NLP_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(NLP_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
 try:
     from orchestrator.orchestrator import compose_prompt, system_prompt_for_intent
 except Exception:
@@ -693,7 +734,10 @@ if st.session_state.get("do_continue"):
         # Branch A: prosegui l’ULTIMA RISPOSTA (comportamento classico)
         last_user_text, last_assistant_text = _find_last_user_and_assistant(hist)
         san_last_user = _sanitize_meta_and_noise(last_user_text)
-        nlp_last = analyze_text(san_last_user) if san_last_user else {"intent": "general"}
+        nlp_last = get_nlp_cached(san_last_user, compute_if_missing=False) if san_last_user else None
+        if not nlp_last:
+            nlp_last = {"intent": "general"}
+
         try:
             k = hashlib.sha1((san_last_user or "").strip().lower().encode("utf-8")).hexdigest()
             ov = st.session_state["intent_overrides"].get(k)
@@ -785,7 +829,7 @@ if st.session_state.get("do_continue"):
         san_user = _sanitize_meta_and_noise(last_user)
 
         if engine_now in ("openai", "hugging"):
-            nlp = analyze_text(san_user)
+            nlp = get_nlp_cached(san_user, compute_if_missing=False) or {}
             sys = system_prompt_for_intent(nlp.get("intent", "general"))
             msgs = [
                 {"role": "system", "content": sys},
@@ -862,7 +906,7 @@ if user:
     with st.chat_message("user"):
         st.markdown(san_user)
 
-    nlp_data = analyze_text(san_user)
+    nlp_data = get_nlp_cached(san_user, compute_if_missing=True)
 
     # ── PATCH: applica override intent se presente per questo testo
     try:
@@ -1019,7 +1063,7 @@ corr_snapshot = {
 try:
     last_user_msg = next((m for m in reversed(st.session_state.history) if m.get("role") == "user"), None)
     if last_user_msg:
-        nlp = analyze_text(last_user_msg.get("content", ""))
+        nlp = get_nlp_cached(last_user_msg.get("content", ""), compute_if_missing=False) or {}
         corr_snapshot["text"] = last_user_msg.get("content", "")
         corr_snapshot["predicted_intent"] = str(nlp.get("intent", "general") or "general")
         corr_snapshot["predicted_score"] = float(nlp.get("score", 0.0) or 0.0)
@@ -1041,7 +1085,24 @@ if st.button("💾 Salva correzione intent"):
     if corr_snapshot["text"]:
         k = _intent_key(corr_snapshot["text"])
         st.session_state["intent_overrides"][k] = corr_sel
+
+        # Aggiorna cache NLP (così i follow-up e il pannello vedono l'intent corretto)
+        cached = st.session_state["nlp_cache"].get(k) or {}
+        pred_int = str(cached.get("intent", "general"))
+        pred_score = float(cached.get("score", 0.0) or 0.0)
+        cached.update({"intent": corr_sel, "score": 0.99, "override": True})
+        st.session_state["nlp_cache"][k] = cached
+
+        # Appendi UNA riga di correzione al log JSONL per gli script di training
+        _append_nlp_correction_log(
+            text=corr_snapshot["text"],
+            predicted_intent=pred_int,
+            predicted_score=pred_score,
+            corrected_intent=corr_sel
+        )
+
         st.success(f"Intent aggiornato per quel messaggio: {corr_sel}")
         st.rerun()  # refresh immediato dell'NLP insight
+
     else:
         st.warning("Nessun messaggio utente da correggere.")
