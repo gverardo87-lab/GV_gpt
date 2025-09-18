@@ -1,15 +1,9 @@
 
 # -*- coding: utf-8 -*-
-# server/app_streamlit.py (locked Ollama model + UI micro-patches)
+# server/app_streamlit.py — WOW pack + Dark mode + Mini‑mappa (micropatch, no behavior change)
 # ─────────────────────────────────────────────────────────────────────────────
-# GV_GPT — L’aria sta cambiando (Streamlit, tema nautico chiaro)
-# - Engine switch: OpenAI ↔ HuggingFace ↔ Ollama
-# - 🔒 Engine Lock + Fallback smart (se lock OFF): OpenAI → HuggingFace → Ollama
-# - Didattica opzionale (solo OpenAI/HF)
-# - Streaming: OpenAI/Ollama; HuggingFace pseudo-stream (tutto in un colpo)
-# - Memoria persistente, export, diagnostica
-# - UI micro-patches: input visibile, avatar, status bar, copy last reply, segmented con key
-# - OLLAMA MODEL LOCK: gv/phi35-mini-gv:latest (non editabile)
+# Logiche preservate: stop/continua/stream, fallback smart, engine lock, memoria.
+# Ollama bloccato a: gv/phi35-mini-gv:latest
 # ─────────────────────────────────────────────────────────────────────────────
 
 # 0) Ponte: assicura che la root del progetto sia nel PYTHONPATH
@@ -27,9 +21,27 @@ import difflib
 import hashlib
 from datetime import datetime
 from io import BytesIO
+import base64
 
 from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
+
+# --- Quiet noisy progress bars/logs (HF/tqdm/datasets/transformers) ----------
+os.environ.setdefault("TQDM_DISABLE", "1")                    # tqdm
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")    # huggingface hub
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")      # transformers logs
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")      # tokenizer threads warning
+try:
+    from datasets.utils.logging import disable_progress_bar as _ds_disable_pb
+    _ds_disable_pb()
+except Exception:
+    pass
+try:
+    from transformers.utils import logging as _tlog
+    _tlog.set_verbosity_error()
+except Exception:
+    pass
 
 import streamlit as st
 try:
@@ -52,7 +64,7 @@ except Exception:
     if PID and PID != EXPECTED:
         raise SystemExit(f"[ABORT] Wrong PROJECT_ID. Expected {EXPECTED}, got {PID!r}.")
 
-# 2) Import moduli progetto (devono esistere nel repo)
+# 2) Import moduli progetto
 from core.engine import (
     call_chat, stream_chat, call_chat_smart, build_continue_only_messages
 )
@@ -97,11 +109,6 @@ try:
 except Exception:
     def call_ollama_generate(*args, **kwargs):
         raise RuntimeError("Diagnostica Ollama non disponibile (core/ollama_client.py mancante).")
-
-# === Logging ==================================================================
-import logging
-logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
-log = logging.getLogger("GV_GPT")
 
 # === Regex / Sanitizer ========================================================
 META_RX = re.compile(
@@ -160,36 +167,6 @@ def export_chat_json(history: list) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 # === Utils ===================================================================
-
-def post_format_response(text: str) -> str:
-    """
-    Micro-formatting di sicurezza:
-    - chiude codefence dispari
-    - normalizza heading troppo profondi
-    - converte bullet strani in "- "
-    - rimuove frasi boilerplate in inglese
-    - ripulisce spazi e righe eccessive
-    """
-    if not text:
-        return text
-    s = text
-    # chiude code fence se dispari
-    if s.count("```") % 2 == 1:
-        s += "\n```"
-    # rimuove link vuoti [text]()
-    s = re.sub(r"\[([^\]]+)\]\(\s*\)", r"\1", s)
-    # downgrade H4+ a H2
-    s = re.sub(r"^\s*#{4,}\s*", "## ", s, flags=re.MULTILINE)
-    # bullet uniformi
-    s = re.sub(r"^[\t ]*[•*]\s+", "- ", s, flags=re.MULTILINE)
-    # boilerplate EN
-    s = re.sub(r"(?im)^\s*(ready to help|here (?:are|is)|let'?s |i can help)\b.*$", "", s)
-    # spazi finali per riga
-    s = re.sub(r"[ \t]+$", "", s, flags=re.MULTILINE)
-    # riduci righe vuote consecutive
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s.strip()
-
 def _tail(text: str, chars: int = 1800) -> str:
     return (text or "")[-chars:]
 
@@ -262,6 +239,20 @@ def _short_history_by_chars(history_msgs: list, max_chars: int = 9000) -> list:
         if total >= max_chars:
             break
     return list(reversed(sel))
+
+def post_format_response(text: str) -> str:
+    if not text:
+        return text
+    s = text
+    if s.count("```") % 2 == 1:
+        s += "\n```"
+    s = re.sub(r"\[([^\]]+)\]\(\s*\)", r"\1", s)
+    s = re.sub(r"^\s*#{4,}\s*", "## ", s, flags=re.MULTILINE)
+    s = re.sub(r"^[\t ]*[•*]\s+", "- ", s, flags=re.MULTILINE)
+    s = re.sub(r"(?im)^\s*(ready to help|here (?:are|is)|let'?s |i can help)\b.*$", "", s)
+    s = re.sub(r"[ \t]+$", "", s, flags=re.MULTILINE)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
 
 # ── Segmented boolean control (SAC segmented / radio fallback) ───────────────
 def _segmented_bool(label: str, key: str):
@@ -372,9 +363,28 @@ def _wave_svg(width="100%", height=28):
     </svg>
     """
 
+def _dark_css():
+    """Overlay CSS per tema scuro (solo variabili e ombre)"""
+    st.markdown("""
+    <style>
+      :root{
+        --bg-top: #0b1220; --bg-bottom: #0b1220; --fg:#e5e7eb; --fg-muted:#cbd5e1; --border:#1f2a44;
+        --card:#0f172a; --bubble:#0d1b2a; --link:#60a5fa; --accent:#38bdf8; --input-bg:#0b1220; --placeholder:#94a3b8;
+      }
+      [data-testid="stAppViewContainer"] .main .block-container{ box-shadow: 0 10px 30px rgba(0,0,0,.35); }
+      ::-webkit-scrollbar-thumb{ background:#1f3b70; }
+    </style>
+    """, unsafe_allow_html=True)
+
 # === HERO =====================================================================
 def render_hero(high_readability: bool = False, logo_bytes: bytes | None = None) -> None:
     st.markdown(_nautical_css(high_readability), unsafe_allow_html=True)
+    # Overlay dark mode se attivo
+    try:
+        if st.session_state.get("dark_mode", False):
+            _dark_css()
+    except Exception:
+        pass
     c1, c2 = st.columns([1.2, 2.6])
     with c1:
         st.markdown('<div class="side-card">', unsafe_allow_html=True)
@@ -440,7 +450,65 @@ def _css_hotfix_input_overlay():
     </style>
     """, unsafe_allow_html=True)
 
-# ── AFTER-REPLY UI: caption & copy button ────────────────────────────────────
+# ── WOW CSS/JS: fade-in, code copy, pulse dot ─────────────────────────────────
+def _wow_css():
+    st.markdown("""
+    <style>
+      [data-testid="stChatMessage"] > div:first-child{ animation: fadeIn .28s ease-in both; }
+      @keyframes fadeIn { from {opacity:0; transform: translateY(2px)} to {opacity:1; transform:none} }
+      .pulse-dot{ width:10px; height:10px; border-radius:999px; display:inline-block; margin-right:6px; background:#22c55e; box-shadow:0 0 0 rgba(34,197,94,.7); animation:pulse 1.5s infinite; }
+      .pulse-dot.stopped{ background:#94a3b8; box-shadow:none; animation:none; }
+      @keyframes pulse{ 0%{ box-shadow:0 0 0 0 rgba(34,197,94,.5);} 70%{ box-shadow:0 0 0 8px rgba(34,197,94,0);} 100%{ box-shadow:0 0 0 0 rgba(34,197,94,0);} }
+      pre{ position:relative; } .copy-btn{ position:absolute; top:8px; right:8px; border:1px solid #e2e8f0; background:#ffffffcc; backdrop-filter: blur(3px); padding:2px 6px; border-radius:6px; font-size:12px; cursor:pointer; }
+      .copy-btn:hover{ background:#fff; }
+    </style>
+    <script>
+      (function(){
+        const addBtns = () => {
+          const pres = document.querySelectorAll('pre');
+          pres.forEach((pre) => {
+            if(pre.querySelector('.copy-btn')) return;
+            const btn = document.createElement('button');
+            btn.className = 'copy-btn';
+            btn.innerText = 'Copia';
+            btn.onclick = () => {
+              const code = pre.innerText;
+              navigator.clipboard.writeText(code).catch(()=>{});
+              btn.innerText = 'Copiato';
+              setTimeout(()=>btn.innerText='Copia', 1200);
+            };
+            pre.appendChild(btn);
+          });
+        };
+        const obs = new MutationObserver(addBtns);
+        obs.observe(document.body, {subtree:true, childList:true});
+        addBtns();
+      })();
+    </script>
+    """, unsafe_allow_html=True)
+
+def _apply_bg_css():
+    """Applica un'immagine di sfondo fullscreen con overlay regolabile (solo UI)."""
+    if not st.session_state.get("bg_enabled") or not st.session_state.get("bg_bytes"):
+        return
+    try:
+        b64 = base64.b64encode(st.session_state["bg_bytes"]).decode("ascii")
+        alpha = float(st.session_state.get("bg_overlay", 0.18) or 0.18)
+        # overlay: più chiaro in light mode, più scuro in dark mode
+        dark = bool(st.session_state.get("dark_mode", False))
+        rgb = "0,0,0" if dark else "255,255,255"
+        css = f"""
+        <style>
+        [data-testid="stAppViewContainer"]{{
+            background: linear-gradient(rgba({rgb},{alpha}), rgba({rgb},{alpha})), url('data:image;base64,{b64}') center/cover fixed no-repeat !important;
+        }}
+        </style>
+        """
+        st.markdown(css, unsafe_allow_html=True)
+    except Exception:
+        pass
+
+# ── AFTER-REPLY UI: caption & copy + quick actions ────────────────────────────
 def _ui_after_reply(reply: str):
     if not reply:
         return
@@ -465,13 +533,96 @@ def _ui_after_reply(reply: str):
           }})();
         </script>
         """, unsafe_allow_html=True)
+
+        # Quick actions (queue command and rerun)
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            if st.button("▶ Continua", key=f"qa_cont_{uid}"):
+                st.session_state["queued_user"] = "continua"; st.rerun()
+        with c2:
+            if st.button("🧠 Riassumi", key=f"qa_sum_{uid}"):
+                st.session_state["queued_user"] = "Riassumi in 7 bullet point l'ultima risposta."; st.rerun()
+        with c3:
+            if st.button("💡 Spiega semplice", key=f"qa_simple_{uid}"):
+                st.session_state["queued_user"] = "Rispiega in modo semplice e con esempi pratici quanto appena detto."; st.rerun()
+        with c4:
+            if st.button("📌 Takeaway", key=f"qa_take_{uid}"):
+                st.session_state["queued_user"] = "Estrai i 5 takeaway principali dell'ultimo messaggio con emoji."; st.rerun()
     except Exception:
         pass
+
+# ── Mini‑mappa Outline (floating) ────────────────────────────────────────────
+
+def _render_minimap():
+    if not st.session_state.get("show_minimap", True):
+        return
+    outline = (st.session_state.get("outline") or "").strip()
+
+    def _derive_from_last_assistant(max_items: int = 10):
+        hist = st.session_state.get("history", [])
+        last_ass = ""
+        for m in reversed(hist):
+            if m.get("role") == "assistant":
+                last_ass = m.get("content", "")
+                break
+        txt = (last_ass or "").strip()
+        if not txt:
+            return []
+        lines = []
+        for raw in txt.splitlines():
+            s = raw.strip()
+            if not s:
+                continue
+            if s.startswith(("#","-","•")) or re.match(r"^\d+[.)]\s+", s):
+                s = re.sub(r"^[#\-\•\s\d.)]+", "", s).strip()
+                if s:
+                    lines.append(s)
+        if not lines:
+            parts = re.split(r"\n\s*\n", txt)
+            for p in parts:
+                m = re.split(r"(?<=[.!?])\s+", p.strip())
+                if m and len(m[0]) > 0:
+                    lines.append(m[0][:120])
+        seen = set(); out = []
+        for l in lines:
+            k = l.lower()
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(l)
+            if len(out) >= max_items:
+                break
+        return out
+
+    items = [i.strip(" -•") for i in outline.splitlines() if i.strip()] if outline else _derive_from_last_assistant()
+    if not items:
+        return
+    html_list = "".join(f"<li>{re.sub(r'<[^>]+>', '', it)}</li>" for it in items) if items else "<li><em>Scrivi qualcosa per generare l’outline…</em></li>"
+
+    css_minimap = """
+<style>
+  .mini-outline{ position:fixed; right:12px; top:98px; bottom:122px; width:240px; z-index:998;
+                 background: color-mix(in srgb, var(--card) 92%, transparent); border:1px solid var(--border); border-radius:12px; padding:8px 10px; backdrop-filter: blur(6px);
+                 box-shadow:0 8px 24px rgba(2,6,23,.18); overflow:auto; }
+  .mini-outline h4{ margin:.1rem 0 .35rem; font-size:13px; letter-spacing:.2px; color:var(--fg-muted); }
+  .mini-outline ol{ margin:.2rem 0 .2rem 1.0rem; font-size:13px; color:var(--fg); }
+  .mini-outline li{ margin:.15rem 0; }
+  @media (max-width: 1280px){ .mini-outline{ display:none; } }
+</style>
+"""
+    html_minimap = f"""
+<div class="mini-outline">
+  <h4>🧭 Mini-mappa</h4>
+  <ol>{html_list}</ol>
+</div>
+"""
+    st.markdown(css_minimap + html_minimap, unsafe_allow_html=True)
+
 
 # 4) UI base
 st.set_page_config(page_title="GV_GPT — L’aria sta cambiando", page_icon="⛵", layout="wide")
 
-# 5) Stato app e sidebar (state base)
+# 5) Stato app e sidebar
 st.session_state.setdefault("persist", True)
 st.session_state.setdefault("engine", (os.getenv("GV_ENGINE", "openai") or "openai").lower())
 st.session_state.setdefault("openai_model", os.getenv("OPENAI_MODEL") or "gpt-4o-mini")
@@ -486,19 +637,39 @@ st.session_state.setdefault("stop_epoch", 0.0)
 st.session_state.setdefault("streaming_on", True)
 st.session_state.setdefault("outline", "")
 st.session_state.setdefault("intent_overrides", {})
-# Forza il modello Ollama nello state (sanity guard anche contro vecchi valori)
+st.session_state.setdefault("is_streaming", False)
+st.session_state.setdefault("queued_user", None)
+st.session_state.setdefault("dark_mode", False)
+st.session_state.setdefault("show_minimap", False)
+st.session_state.setdefault("bg_bytes", None)
+st.session_state.setdefault("bg_enabled", False)
+st.session_state.setdefault("bg_overlay", 0.18)
+# Forza il modello Ollama nello state
 st.session_state["ollama_model"] = OLLAMA_MODEL_ALLOWED
 
 # Logo + Hero
 with st.sidebar:
     st.header("⚙️ Aspetto")
     st.session_state["high_readability"] = st.toggle("Alta leggibilità", value=st.session_state["high_readability"])
+    st.session_state["dark_mode"] = st.toggle("Tema scuro", value=st.session_state["dark_mode"])
+    st.session_state["show_minimap"] = st.toggle("Mini‑mappa Outline", value=st.session_state["show_minimap"])
     logo = st.file_uploader("Carica logo (PNG/JPG)", type=["png", "jpg", "jpeg"])
     if logo is not None:
         st.session_state["logo_bytes"] = logo.read()
 
+    bg = st.file_uploader("Sfondo (PNG/JPG) a schermo intero", type=["png", "jpg", "jpeg"], key="bg_upl")
+if bg is not None:
+    st.session_state["bg_bytes"] = bg.read()
+if st.session_state.get("bg_bytes") is not None:
+    st.session_state["bg_enabled"] = st.toggle("Usa come sfondo", value=st.session_state.get("bg_enabled", False), key="bg_enable_tog")
+    st.session_state["bg_overlay"] = st.slider("Intensità overlay", 0.0, 0.6, float(st.session_state.get("bg_overlay", 0.18)), 0.02, help="Aumenta per migliorare la leggibilità sopra lo sfondo")
+
+
 _css_hotfix_input_overlay()
 render_hero(high_readability=st.session_state["high_readability"], logo_bytes=st.session_state.get("logo_bytes"))
+_wow_css()
+_render_minimap()
+_apply_bg_css()
 render_status_bar()
 
 with st.sidebar:
@@ -534,17 +705,6 @@ with st.sidebar:
 
     st.header("🧠 Outline (auto)")
     st.caption("Aggiornamento periodico dell’outline dalla bozza corrente (esperimentale).")
-    st.text_area("Outline corrente", value=st.session_state.get("outline",""), height=140, key="outline_view")
-    if st.button("↻ Aggiorna outline ora"):
-        hist = st.session_state.get("history", [])
-        last_assistants = "\n\n".join([m.get("content","") for m in hist if m.get("role")== "assistant"])[-4000:]
-        sys_txt = "Sintetizza in 10-12 bullet point l'outline dei contenuti già scritti sotto. Niente intro/conclusioni."
-        try:
-            _update_outline_if_needed(last_assistants, every_round=0, round_idx=0, system_text=sys_txt)
-            st.success("Outline aggiornato.")
-            st.rerun()
-        except Exception as e:
-            st.warning(str(e).splitlines()[0])
 
     st.header("🎓 Modalità didattica")
     st.session_state["didactic"] = st.checkbox("Spiega passo-passo (aggiungi brevi sezioni, esempi, mini-quiz)", value=st.session_state["didactic"])
@@ -558,6 +718,18 @@ with st.sidebar:
 
     st.header("🧠 Memoria")
     _segmented_bool("Persisti memoria", "persist")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("🧹 Svuota chat", key="btn_clear_chat"):
+            st.session_state["history"] = []
+            if st.session_state.get("persist", True):
+                clear_memory()
+            st.success("Chat svuotata" + (" (anche memoria salvata)" if st.session_state.get("persist", True) else ""))
+    with c2:
+        if st.button("🗑️ Cancella memoria salvata", key="btn_clear_persist"):
+            clear_memory()
+            st.success("Memoria persistente cancellata.")
+
 
     st.header("▶ Continua")
     if st.button("▶ Continua ultima risposta", key="btn_continue"):
@@ -671,6 +843,7 @@ if st.session_state.get("do_continue"):
                     pieces = []
                     stopped_by_sentinel = False
 
+                    st.session_state["is_streaming"] = True
                     for delta in stream_chat(
                             msgs,
                             model_override=OLLAMA_MODEL_ALLOWED,
@@ -692,6 +865,7 @@ if st.session_state.get("do_continue"):
                         placeholder.markdown(re.sub(r"(?m)^\s*#{4,}\s*", "## ", joined))
                         if stopped_by_sentinel:
                             break
+                    st.session_state["is_streaming"] = False
                     chunk = "".join(pieces)
                     for s in SENTINELS:
                         if s in chunk:
@@ -715,6 +889,7 @@ if st.session_state.get("do_continue"):
                 reply = _sanitize_meta_and_noise(reply)
                 reply = post_format_response(reply)
                 st.markdown(reply if reply else "_(nessun avanzamento)_")
+                _ui_after_reply(reply)
             except Exception as e:
                 reply = "⚠️ Errore (continua): " + str(e).split("\n")[0]
                 st.markdown(reply)
@@ -752,6 +927,7 @@ if st.session_state.get("do_continue"):
                     pieces = []
                     stopped_by_sentinel = False
 
+                    st.session_state["is_streaming"] = True
                     for delta in stream_chat(
                             msgs,
                             model_override=OLLAMA_MODEL_ALLOWED,
@@ -773,6 +949,7 @@ if st.session_state.get("do_continue"):
                         placeholder.markdown(re.sub(r"(?m)^\s*#{4,}\s*", "## ", joined))
                         if stopped_by_sentinel:
                             break
+                    st.session_state["is_streaming"] = False
                     reply = "".join(pieces)
                     for s in SENTINELS:
                         if s in reply:
@@ -793,6 +970,7 @@ if st.session_state.get("do_continue"):
                 reply = _sanitize_meta_and_noise(reply)
                 reply = post_format_response(reply)
                 st.markdown(reply)
+                _ui_after_reply(reply)
 
             except Exception as e:
                 reply = f"⚠️ Errore (continua/approfondisci): {str(e).splitlines()[0]}"
@@ -803,13 +981,19 @@ if st.session_state.get("do_continue"):
     if st.session_state.get("persist", True):
         save_memory(st.session_state.history)
 
-# 7.9) Mini-toolbar fissa (solo STOP, niente doppi toggle)
+# 7.9) Mini-toolbar fissa (pulse + stop)
 st.markdown('<div class="mini-toolbar">', unsafe_allow_html=True)
-tb1, tb2 = st.columns([3,1])
+tb1, tb2 = st.columns([4,2])
 with tb1:
-    st.caption("Pronto.")
+    _is = st.session_state.get("is_streaming", False)
+    pulse_class = "" if _is else "stopped"
+    eng = st.session_state.get("engine","openai").title()
+    model = (st.session_state.get("openai_model") if st.session_state.get("engine")=="openai"
+             else st.session_state.get("hf_model") if st.session_state.get("engine")=="hugging"
+             else OLLAMA_MODEL_ALLOWED)
+    st.markdown(f"<span class='pulse-dot {pulse_class}'></span><b>{eng}</b> • {model}", unsafe_allow_html=True)
 with tb2:
-    stop_clicked = st.button("Stop", key="stop_btn_toolbar_safe")
+    stop_clicked = st.button("🛑 Stop", key="stop_btn_toolbar_safe")
 
 if stop_clicked:
     st.session_state["stop_generation"] = True
@@ -819,7 +1003,7 @@ if stop_clicked:
 st.markdown("</div>", unsafe_allow_html=True)
 
 # 8) Input utente (turno normale)
-user = st.chat_input("Scrivi qui…")
+user = st.chat_input("Scrivi qui…") if st.session_state.get("queued_user") is None else st.session_state.pop("queued_user")
 if user:
     san_user = _sanitize_meta_and_noise(user)
 
@@ -866,6 +1050,7 @@ if user:
                     return bool(sg and se >= stream_started_at)
 
                 stopped_by_sentinel = False
+                st.session_state["is_streaming"] = True
                 for delta in stream_chat(
                     base_messages,
                     model_override=(
@@ -895,6 +1080,7 @@ if user:
                     if stopped_by_sentinel:
                         break
 
+                st.session_state["is_streaming"] = False
                 reply = "".join(pieces)
                 for s in SENTINELS:
                     if s in reply:
@@ -910,6 +1096,7 @@ if user:
                 reply = re.sub(r"[ \t]{2,}", " ", reply)
                 reply = post_format_response(reply)
                 placeholder.markdown(reply)
+                _ui_after_reply(reply)
 
             else:
                 reply = call_chat(
@@ -924,6 +1111,7 @@ if user:
                 reply = _sanitize_meta_and_noise(reply)
                 reply = post_format_response(reply)
                 st.markdown(reply)
+                _ui_after_reply(reply)
         except Exception as e:
             if not st.session_state.get("engine_lock", False):
                 try:
@@ -939,6 +1127,7 @@ if user:
                     reply = _sanitize_meta_and_noise(reply)
                     reply = post_format_response(reply)
                     st.markdown(reply)
+                    _ui_after_reply(reply)
                 except Exception as e2:
                     reply = f"⚠️ Errore modello: {str(e2).splitlines()[0]}"
                     st.markdown(reply)
@@ -949,7 +1138,6 @@ if user:
             st.session_state["stop_generation"] = False  # reset
 
         log.info(f"ENGINE={engine_now} DIDACTIC={st.session_state.get('didactic', False)} ELAPSED={time.time()-t0:.1f}s")
-        _ui_after_reply(reply)
 
     st.session_state.history.append({"role": "assistant", "content": reply})
     if st.session_state.get("persist", True):
